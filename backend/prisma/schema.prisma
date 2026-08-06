@@ -1,0 +1,44 @@
+// Prisma schema for the airtime vending platform.
+// Run `npm run prisma:migrate` after setting DATABASE_URL in .env
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TransactionStatus {
+  PENDING_PAYMENT   // STK push sent, waiting for M-Pesa callback
+  PAYMENT_FAILED    // customer cancelled / insufficient funds / timeout
+  PAYMENT_RECEIVED  // M-Pesa confirmed payment, airtime not yet delivered
+  AIRTIME_SENT      // airtime delivered successfully
+  AIRTIME_FAILED    // payment succeeded but airtime delivery failed -> needs refund/retry
+  REFUNDED
+}
+
+model Transaction {
+  id                String             @id @default(uuid())
+  phoneNumber       String             // recipient phone number, E.164-ish e.g. 2547XXXXXXXX
+  amount            Int                // KES, whole shillings
+  status            TransactionStatus  @default(PENDING_PAYMENT)
+
+  // M-Pesa side
+  merchantRequestId String?            // returned by STK push initiation
+  checkoutRequestId String?            @unique
+  mpesaReceiptNumber String?           @unique // set once payment confirmed
+  payerPhoneNumber  String?            // phone that actually paid (usually same as phoneNumber)
+
+  // Airtime delivery side
+  airtimeProviderRef String?           // provider's transaction/reference id
+  failureReason      String?
+
+  retryCount        Int                @default(0)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  @@index([phoneNumber])
+  @@index([status])
+}
