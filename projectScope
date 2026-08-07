@@ -1,0 +1,113 @@
+1. Core Functional Domains
+1.1 Payment Initiation & Processing
+
+What it must do:
+
+Accept payment requests across all flows (buy self, buy other, till-to-till, scratch card, E-TopUp)
+Generate a unique, idempotent transaction ID before any external API call — never after
+Trigger STK Push within ~1–2s of request (Daraja API latency is the bottleneck, not your code)
+Handle the "user didn't respond to STK prompt" case — Safaricom will eventually timeout the push (~60–90s); you need a corresponding timeout state on your end, not an infinite "pending"
+
+Performance expectation: STK Push initiation response to client: under 3s. If Daraja is slow, don't make the user wait — return "processing" immediately and let status polling/webhook handle the rest.
+
+1.2 Webhook / Callback Reliability
+
+What it must do:
+
+Receive Daraja callbacks on a dedicated, always-available endpoint (not behind auth — Safaricom can't log in)
+Verify payload authenticity/source before trusting it (IP allowlist or signature check, per Daraja docs)
+Process idempotently — the same callback arriving twice (which happens) must not double-dispense airtime
+Persist the raw payload before processing, so nothing is ever lost even if your processing logic throws
+
+Performance expectation: Callback acknowledged (200 response to Safaricom) in under 500ms. Do the actual heavy processing (dispensing airtime, updating status) asynchronously via a queue job — don't make Safaricom wait on your reseller API call.
+
+This is where BullMQ earns its place: callback comes in → validate → enqueue a job → return 200 immediately → job worker handles dispensing + retries independently.
+
+1.3 Reconciliation (the part most MVPs skip, and enterprise systems don't)
+
+What it must do:
+
+Run a background job every 1–5 minutes scanning for transactions stuck in stk_sent or paid beyond expected thresholds
+Actively query Daraja's Transaction Status API for those stuck transactions rather than waiting for a callback that may never arrive
+Flag transactions that are inconsistent (e.g., Daraja says paid, but airtime dispensing failed) for either auto-retry or human review
+
+Why this matters: callbacks fail to arrive a meaningful percentage of the time in real-world M-Pesa integrations — network issues, Safaricom-side delays, server restarts during the callback window. An enterprise system doesn't treat "wait for webhook" as the only path to truth.
+
+1.4 Airtime/Card Dispensing
+
+What it must do:
+
+Call the reseller/telco API only after payment is confirmed (via callback OR reconciliation — either source of truth)
+Retry on transient failures (network blip, reseller API 5xx) with exponential backoff, capped at N attempts
+On repeated failure, don't leave the user's money in limbo — either auto-refund or escalate to a manual-refund queue visible in the admin dashboard
+Record dispensing confirmation (reseller's own transaction/reference ID) for audit and dispute resolution
+
+Performance expectation: dispensing attempt within 5–10s of payment confirmation under normal conditions.
+
+1.5 Till-to-Till / Manual Code Redemption
+
+What it must do:
+
+Validate the pasted code against Daraja's Transaction Status API (or your Stratum reconciliation feed) — never trust regex-parsed text alone as authorization
+Enforce single-use at the database level (unique constraint on the code), not just application logic, to survive race conditions (two requests submitting the same code near-simultaneously)
+Rate-limit submission attempts per user/IP to prevent code-guessing abuse
+1.6 Status Polling API
+
+What it must do:
+
+Return current, uncached state on every request (Cache-Control: no-store, no ETags)
+Support both polling (simple, works everywhere) and, longer-term, WebSocket/SSE push for lower latency and reduced server load at scale
+Auto-expire/stop client-side polling after a reasonable window (60–90s), falling back to "we'll notify you" messaging
+1.7 AI Assistant Layer
+
+Support chat:
+
+Tool-call into your own transaction/status data — never let the model answer "where's my airtime" from imagination
+Clear escalation to human support for disputes, fraud claims, refund requests
+
+SMS/code parsing:
+
+AI extracts structured fields from pasted M-Pesa text (convenience layer only)
+Daraja/Stratum API remains the sole source of truth for authorization — the AI never authorizes a payout by itself
+1.8 Admin / Ops Dashboard
+
+What it must do:
+
+Real-time transaction feed (all flows, filterable by status/network/date)
+Manual intervention tools: force-retry dispensing, manual refund, mark resolved
+Float/balance monitoring per network — alert before you run out of stock to fulfill orders
+Redeemed-code audit trail with flagged duplicate attempts
+Callback health metrics — success rate, latency, failure spikes (an early warning system for Safaricom-side issues)
+1.9 Security & Compliance
+
+What it must do:
+
+All secrets (Daraja keys, DB credentials, reseller API keys) in environment variables/secrets manager
+Rate limiting on every public endpoint, stricter on payment-initiation and code-redemption
+Audit logging on every state-changing action, with actor (user/system/admin) and timestamp
+PII handling: phone numbers and transaction data should be access-controlled, not queryable by just anyone with DB access
+2. Non-Functional / Performance Targets
+Metric	Target
+STK Push initiation response	< 3s
+Callback acknowledgment	< 500ms
+Airtime dispensing after confirmed payment	< 10s (normal conditions)
+Status endpoint response	< 200ms
+Reconciliation job frequency	every 1–5 min
+Uptime target	99.5%+ (paid DB tier, proper process management, no free-tier flapping)
+Callback duplicate-processing rate	0% (must be mathematically impossible via idempotency keys, not just "unlikely")
+3. What Separates "Working Demo" from "Enterprise-Grade" Here
+Idempotency everywhere — every state-changing endpoint (payment init, callback, redemption, dispensing) must be safe to call twice with the same key and produce the same result, not a duplicate side effect.
+Reconciliation, not just webhooks — treating the webhook as the only source of truth is the #1 way these systems silently lose money or strand users in "pending" forever.
+Queue-based async processing — anything slow (external API calls) happens off the request/response cycle, via BullMQ jobs with retries, not inline in a route handler.
+Observability — structured logs keyed by transaction ID, error tracking (Sentry), and dashboards showing callback success rates and dispensing failure rates in real time, not just console.log output in a terminal you have to be watching.
+Database-level guarantees, not just application logic — unique constraints, foreign keys, and transactions (DB transactions, not payment transactions) enforcing correctness even if application code has bugs or races.
+Graceful degradation — when a downstream dependency (Daraja, reseller API) is slow or down, the system queues and retries rather than failing the user's request outright or hanging indefinitely.
+4. Suggested Build Order
+Core payment flow (self/other) end-to-end, with proper idempotency and status polling — get this rock-solid before adding more flows
+Reconciliation job — don't skip this, even in v1
+Till-to-till redemption with DB-level duplicate prevention
+Admin dashboard (basic feed + manual override is enough for v1)
+Scratch cards / E-TopUp
+AI support chat
+AI SMS parsing
+Observability/monitoring polish, load testing, then move off any free-tier infra before real launch

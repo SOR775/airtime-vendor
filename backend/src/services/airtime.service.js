@@ -140,6 +140,14 @@ const PROVIDERS = {
 
 async function sendAirtime({ phone, amount }) {
   const providerName = (config.airtimeProvider || "mock").toLowerCase();
+  // If the requested amount is below the provider's minimum, use mock
+  // delivery in development to avoid provider-side validation errors
+  // (e.g., Statum requires at least 5 KES). This keeps dev flow working
+  // for small amounts while preventing unintended charges.
+  if (Number(amount) < Number(config.airtimeMinAmount || 5)) {
+    console.warn(`[airtime] Requested amount ${amount} is below provider minimum ${config.airtimeMinAmount}; using mock delivery.`);
+    return sendViaMock({ phone, amount });
+  }
   const shouldUseMock =
     providerName === "mock" ||
     (providerName === "africastalking" && (!config.airtimeUsername || !config.airtimeApiKey)) ||

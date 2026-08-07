@@ -16,30 +16,34 @@ const MAX_AMOUNT = 10000; // set a sane ceiling; tune to your risk appetite
  * endpoint does NOT wait for that, it just confirms the prompt was sent.
  */
 async function initiate(req, res) {
-  const { phone, amount } = req.body;
+  const { recipientPhone, buyerPhone, amount } = req.body;
 
-  if (!phone || !amount) {
-    return res.status(400).json({ error: "phone and amount are required" });
+  if (!recipientPhone || !amount) {
+    return res.status(400).json({ error: "recipientPhone and amount are required" });
   }
   const amt = Number(amount);
   if (!Number.isFinite(amt) || amt < MIN_AMOUNT || amt > MAX_AMOUNT) {
     return res.status(400).json({ error: `amount must be between ${MIN_AMOUNT} and ${MAX_AMOUNT}` });
   }
 
-  let normalizedPhone;
+  let normalizedRecipientPhone;
+  let normalizedBuyerPhone = null;
   try {
-    normalizedPhone = mpesa.normalizePhone(phone);
+    normalizedRecipientPhone = mpesa.normalizePhone(recipientPhone);
+    if (buyerPhone && String(buyerPhone).trim()) {
+      normalizedBuyerPhone = mpesa.normalizePhone(buyerPhone);
+    }
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
 
   const transaction = await prisma.transaction.create({
-    data: { phoneNumber: normalizedPhone, amount: amt },
+    data: { phoneNumber: normalizedRecipientPhone, amount: amt },
   });
 
   try {
     const stkResponse = await mpesa.initiateSTKPush({
-      phone: normalizedPhone,
+      phone: normalizedBuyerPhone || normalizedRecipientPhone,
       amount: amt,
       accountReference: transaction.id,
       transactionDesc: "Airtime",
@@ -53,8 +57,16 @@ async function initiate(req, res) {
       },
     });
 
+    logger.info("STK push initiated", {
+      transactionId: transaction.id,
+      merchantRequestId: stkResponse.MerchantRequestID,
+      checkoutRequestId: stkResponse.CheckoutRequestID,
+      response: stkResponse,
+    });
+
     return res.status(202).json({
       transactionId: transaction.id,
+      checkoutRequestId: stkResponse.CheckoutRequestID,
       message: "Check your phone and enter your M-Pesa PIN to complete payment.",
     });
   } catch (err) {
@@ -76,32 +88,88 @@ async function initiate(req, res) {
  * which you should monitor and handle via a retry job or manual refund).
  */
 async function callback(req, res) {
-  // Always ack Safaricom immediately so they don't retry the callback --
-  // do the real work after, and log heavily since this endpoint is your
-  // only signal that money actually moved.
+  // Persist raw callback payload for audit before processing. This ensures
+  // Daraja's POST is recorded even if later processing fails.
+  let savedCallback = null;
+  try {
+    savedCallback = await prisma.mpesaCallback.create({
+      data: {
+        darajaCallbackId: req.body?.Body?.stkCallback?.CheckoutRequestID || null,
+        checkoutRequestId: req.body?.Body?.stkCallback?.CheckoutRequestID || null,
+        raw: req.body,
+      },
+    });
+  } catch (err) {
+    logger.error("Failed to persist raw MPesa callback", err.message || err);
+  }
+
+  const callbackMeta = {
+    darajaCallbackId: req.body?.Body?.stkCallback?.MerchantRequestID || null,
+    checkoutRequestId: req.body?.Body?.stkCallback?.CheckoutRequestID || null,
+    resultCode: req.body?.Body?.stkCallback?.ResultCode ?? null,
+    resultDesc: req.body?.Body?.stkCallback?.ResultDesc || null,
+  };
+
+  logger.info("MPesa callback received", callbackMeta);
+
+  // Acknowledge immediately so Safaricom doesn't retry the callback.
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
 
   let parsed;
   try {
     parsed = mpesa.parseStkCallback(req.body);
   } catch (err) {
-    logger.error("Could not parse STK callback", req.body);
+    logger.error("Could not parse STK callback", { error: err.message || err, body: req.body });
+    if (savedCallback) {
+      await prisma.mpesaCallback.update({
+        where: { id: savedCallback.id },
+        data: { processed: true, processedAt: new Date(), processingError: 'parse_error' },
+      });
+    }
     return;
   }
 
-  const transaction = await prisma.transaction.findUnique({
-    where: { checkoutRequestId: parsed.checkoutRequestId },
+  logger.info("Parsed STK callback", {
+    checkoutRequestId: parsed.checkoutRequestId,
+    merchantRequestId: parsed.merchantRequestId,
+    success: parsed.success,
+    resultDesc: parsed.resultDesc,
   });
+
+  // Prevent duplicate processing: if we've already processed a callback for
+  // this checkoutRequestId, skip further work.
+  if (parsed.checkoutRequestId) {
+    const already = await prisma.mpesaCallback.findFirst({ where: { checkoutRequestId: parsed.checkoutRequestId, processed: true } });
+    if (already) {
+      logger.info("Duplicate STK callback ignored", { checkoutRequestId: parsed.checkoutRequestId });
+      return;
+    }
+  }
+
+  const transaction = await prisma.transaction.findUnique({ where: { checkoutRequestId: parsed.checkoutRequestId } });
   if (!transaction) {
-    logger.error("Callback for unknown transaction", parsed.checkoutRequestId);
+    logger.error("Callback for unknown transaction", { checkoutRequestId: parsed.checkoutRequestId });
+    if (savedCallback) {
+      await prisma.mpesaCallback.update({
+        where: { id: savedCallback.id },
+        data: { processed: true, processedAt: new Date(), processingError: 'unknown_transaction' },
+      });
+    }
     return;
   }
 
   if (!parsed.success) {
+    logger.info("STK callback indicates payment failed", { transactionId: transaction.id, resultDesc: parsed.resultDesc });
     await prisma.transaction.update({
       where: { id: transaction.id },
       data: { status: "PAYMENT_FAILED", failureReason: parsed.resultDesc },
     });
+    if (savedCallback) {
+      await prisma.mpesaCallback.update({
+        where: { id: savedCallback.id },
+        data: { processed: true, processedAt: new Date(), transactionId: transaction.id },
+      });
+    }
     return;
   }
 
@@ -113,6 +181,15 @@ async function callback(req, res) {
       payerPhoneNumber: parsed.payerPhoneNumber,
     },
   });
+
+  // Link the saved callback to the transaction before delivery.
+  if (savedCallback) {
+    try {
+      await prisma.mpesaCallback.update({ where: { id: savedCallback.id }, data: { transactionId: transaction.id } });
+    } catch (err) {
+      logger.error('Failed to link mpesa callback to transaction', err.message || err);
+    }
+  }
 
   // Payment confirmed -- now actually deliver the airtime.
   try {
@@ -143,6 +220,14 @@ async function callback(req, res) {
       data: { status: "AIRTIME_FAILED", failureReason: err.message },
     });
   }
+    // mark callback processed (success case or failure above will still mark processed)
+    if (savedCallback) {
+      try {
+        await prisma.mpesaCallback.update({ where: { id: savedCallback.id }, data: { processed: true, processedAt: new Date() } });
+      } catch (err) {
+        logger.error('Failed to mark mpesa callback processed', err.message || err);
+      }
+    }
 }
 
 /**
@@ -153,12 +238,22 @@ async function status(req, res) {
   const transaction = await prisma.transaction.findUnique({ where: { id: req.params.id } });
   if (!transaction) return res.status(404).json({ error: "Transaction not found" });
 
+  // Ensure polling clients never receive cached 304 responses.
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.set("Pragma", "no-cache");
+
+  // Helpful debug log so frontend polling issues are easier to trace in server logs.
+  logger.info("Status requested", { transactionId: req.params.id, status: transaction.status });
+
   return res.json({
     id: transaction.id,
     status: transaction.status,
     amount: transaction.amount,
     phoneNumber: transaction.phoneNumber,
+    payerPhoneNumber: transaction.payerPhoneNumber,
     failureReason: transaction.failureReason,
+    createdAt: transaction.createdAt,
+    updatedAt: transaction.updatedAt,
   });
 }
 
@@ -232,6 +327,39 @@ async function airtimeWebhook(req, res) {
   return res.json({ ok: true });
 }
 
+async function handleDuplicateClaim(claimReference) {
+  const existing = await prisma.redeemedCode.findUnique({
+    where: { code: claimReference },
+    include: { transaction: true },
+  });
+
+  if (!existing || !existing.transaction) {
+    return { message: "This M-Pesa claim has already been used." };
+  }
+
+  const transaction = existing.transaction;
+  let note = "This M-Pesa claim has already been used.";
+  if (transaction.status === "AIRTIME_FAILED") {
+    note = "Payment succeeded but airtime delivery failed. Retry using the returned transactionId.";
+  } else if (transaction.status === "PAYMENT_RECEIVED") {
+    note = "Payment succeeded but airtime delivery is still pending.";
+  } else if (transaction.status === "AIRTIME_SENT") {
+    note = "Airtime has already been sent for this claim.";
+  } else if (transaction.status === "PENDING_PAYMENT") {
+    note = "Payment is still pending confirmation.";
+  } else if (transaction.status === "PAYMENT_FAILED") {
+    note = "The payment for this claim failed.";
+  }
+
+  return {
+    message: "This M-Pesa claim has already been used.",
+    transactionId: transaction.id,
+    status: transaction.status,
+    failureReason: transaction.failureReason,
+    note,
+  };
+}
+
 async function redeemPayment(req, res) {
   const { mpesaText, phone, amount } = req.body;
   if (!mpesaText || typeof mpesaText !== "string") {
@@ -262,34 +390,53 @@ async function redeemPayment(req, res) {
     return res.status(400).json({ error: err.message });
   }
 
-  let transaction = null;
   const claimReference = parsed.claimReference;
-  if (claimReference) {
-    transaction = await prisma.transaction.findFirst({ where: { mpesaReceiptNumber: claimReference } });
-    if (transaction) {
-      return res.status(409).json({ success: false, error: "This M-Pesa claim has already been used.", transactionId: transaction.id });
-    }
-  }
+  let transaction = null;
 
-  if (!transaction) {
+  if (claimReference) {
+    try {
+      transaction = await prisma.$transaction(async (tx) => {
+        await tx.redeemedCode.create({
+          data: { code: claimReference, amount: amountValue, phoneNumber: normalizedPhone },
+        });
+
+        const createdTransaction = await tx.transaction.create({
+          data: {
+            phoneNumber: normalizedPhone,
+            amount: amountValue,
+            status: "PAYMENT_RECEIVED",
+            mpesaReceiptNumber: claimReference,
+            payerPhoneNumber: normalizedPhone,
+          },
+        });
+
+        await tx.redeemedCode.update({
+          where: { code: claimReference },
+          data: { transactionId: createdTransaction.id, redeemedAt: new Date() },
+        });
+
+        return createdTransaction;
+      });
+    } catch (err) {
+      if (err && err.code === "P2002") {
+        const duplicate = await handleDuplicateClaim(claimReference);
+        return res.status(409).json({
+          success: false,
+          error: duplicate.message,
+          transactionId: duplicate.transactionId,
+          status: duplicate.status,
+          failureReason: duplicate.failureReason,
+          note: duplicate.note,
+        });
+      }
+      throw err;
+    }
+  } else {
     transaction = await prisma.transaction.create({
       data: {
         phoneNumber: normalizedPhone,
         amount: amountValue,
         status: "PAYMENT_RECEIVED",
-        mpesaReceiptNumber: claimReference,
-        payerPhoneNumber: normalizedPhone,
-      },
-    });
-  } else {
-    if (transaction.status === "AIRTIME_SENT") {
-      return res.json({ success: true, message: "Airtime was already delivered for this payment.", transactionId: transaction.id });
-    }
-    await prisma.transaction.update({
-      where: { id: transaction.id },
-      data: {
-        status: "PAYMENT_RECEIVED",
-        mpesaReceiptNumber: claimReference || transaction.mpesaReceiptNumber,
         payerPhoneNumber: normalizedPhone,
       },
     });
@@ -307,16 +454,20 @@ async function redeemPayment(req, res) {
 
     await prisma.transaction.update({
       where: { id: transaction.id },
-      data: { status: "AIRTIME_FAILED", failureReason: result.error },
+      data: { status: "AIRTIME_FAILED", failureReason: result.error || "Airtime delivery failed" },
     });
-    return res.status(502).json({ success: false, error: result.error || "Airtime delivery failed", transactionId: transaction.id });
+    return res.status(502).json({
+      success: false,
+      error: result.error || "Airtime delivery failed",
+      transactionId: transaction.id,
+    });
   } catch (err) {
     logger.error("Airtime redemption threw", err.message || err);
     await prisma.transaction.update({
       where: { id: transaction.id },
       data: { status: "AIRTIME_FAILED", failureReason: err.message || "Airtime redemption failed" },
     });
-    return res.status(500).json({ error: "Airtime redemption failed" });
+    return res.status(500).json({ error: "Airtime redemption failed", transactionId: transaction.id });
   }
 }
 

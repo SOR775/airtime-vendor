@@ -39,6 +39,52 @@ model Transaction {
   createdAt         DateTime           @default(now())
   updatedAt         DateTime           @updatedAt
 
+  // Relations
+  mpesaCallbacks    MpesaCallback[]
+  redeemedCodes     RedeemedCode[]
+  aiParses          AiParse[]
+
   @@index([phoneNumber])
   @@index([status])
+}
+
+model MpesaCallback {
+  id                 String    @id @default(uuid())
+  darajaCallbackId   String?   @unique
+  checkoutRequestId  String?
+  transactionId      String?
+  transaction        Transaction? @relation(fields: [transactionId], references: [id])
+  raw                Json
+  receivedAt         DateTime  @default(now())
+  processedAt        DateTime?
+  processed          Boolean   @default(false)
+  processingError    String?
+
+  @@index([checkoutRequestId])
+}
+
+model RedeemedCode {
+  id           String   @id @default(uuid())
+  code         String   @unique
+  transaction  Transaction? @relation(fields: [transactionId], references: [id])
+  transactionId String?
+  amount       Int
+  phoneNumber  String?
+  createdAt    DateTime @default(now())
+  redeemedAt   DateTime?
+
+  @@index([code])
+}
+
+model AiParse {
+  id           String   @id @default(uuid())
+  mpesaText    String
+  model        String?
+  suggestion   Json?
+  authoritative Json?
+  transaction  Transaction? @relation(fields: [transactionId], references: [id])
+  transactionId String?
+  createdAt    DateTime @default(now())
+
+  @@index([transactionId])
 }

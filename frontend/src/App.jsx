@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { initiatePayment, getTransactionStatus, redeemPayment } from "./services/api";
+import { initiatePayment, getTransactionStatus, redeemPayment, retryAirtime } from "./services/api";
+import AdminReviewPage from "./pages/AdminReview.jsx";
+import SupportChat from "./pages/SupportChat.jsx";
+import Logo from "./components/Logo.jsx";
 
 const TERMINAL_STATUSES = ["AIRTIME_SENT", "AIRTIME_FAILED", "PAYMENT_FAILED", "REFUNDED"];
 const STATUS_COPY = {
-  PENDING_PAYMENT: "Check your phone and enter your M-Pesa PIN.",
+  PENDING_PAYMENT: "Waiting for M-Pesa confirmation. If you already completed the payment prompt, your backend callback may still be pending.",
   PAYMENT_RECEIVED: "Payment completed. Delivering airtime to your number now.",
   AIRTIME_SENT: "Airtime landed successfully. Your phone is topped up!",
   AIRTIME_FAILED: "Payment succeeded but airtime delivery failed. Please try again or contact support.",
@@ -86,7 +89,8 @@ const STYLES = `
 `;
 
 export default function App() {
-  const [phone, setPhone] = useState("");
+  const [recipientPhone, setRecipientPhone] = useState("");
+  const [buyerPhone, setBuyerPhone] = useState("");
   const [amount, setAmount] = useState("");
   const [transactionId, setTransactionId] = useState(null);
   const [status, setStatus] = useState(null);
@@ -94,23 +98,155 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [redeemMode, setRedeemMode] = useState(false);
+  const [latestTransaction, setLatestTransaction] = useState(null);
+  const VIEWS = {
+    HOME: "home",
+    BUY: "buy",
+    REDEEM: "redeem",
+    SUPPORT: "support",
+    ADMIN: "admin",
+    ABOUT: "about",
+    LOGIN: "login",
+  };
+  const [view, setView] = useState(() => {
+    const path = window.location.pathname;
+    if (path === "/admin") return VIEWS.ADMIN;
+    if (path === "/support") return VIEWS.SUPPORT;
+    if (path === "/about") return VIEWS.ABOUT;
+    return VIEWS.HOME;
+  });
+  const isHome = view === VIEWS.HOME;
+  const isBuy = view === VIEWS.BUY;
+  const isRedeem = view === VIEWS.REDEEM;
+  const isSupport = view === VIEWS.SUPPORT;
+  const isAbout = view === VIEWS.ABOUT;
+  const isAdmin = view === VIEWS.ADMIN;
+  const isLogin = view === VIEWS.LOGIN;
+  const [isAuthenticated, setIsAuthenticated] = useState(() => localStorage.getItem("airtimee-auth") === "true");
+  const [user, setUser] = useState(() => localStorage.getItem("airtimee-user") || "");
+  const [loginError, setLoginError] = useState(null);
+  const [loginSubmitting, setLoginSubmitting] = useState(false);
   const [mpesaText, setMpesaText] = useState("");
   const [redeemResult, setRedeemResult] = useState(null);
+  const [redeemPhone, setRedeemPhone] = useState("");
+  const [notification, setNotification] = useState(null);
+  const [retryMessage, setRetryMessage] = useState(null);
+  const [retrying, setRetrying] = useState(false);
   const pollRef = useRef(null);
+  const notificationTimeoutRef = useRef(null);
+  const prevStatusRef = useRef(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+      if (notificationTimeoutRef.current) {
+        clearTimeout(notificationTimeoutRef.current);
+      }
+    };
   }, []);
+
+  function showNotification({ type, message }) {
+    if (!mountedRef.current) return;
+    if (notificationTimeoutRef.current) {
+      clearTimeout(notificationTimeoutRef.current);
+    }
+    setNotification({ type, message });
+    notificationTimeoutRef.current = window.setTimeout(() => {
+      if (mountedRef.current) setNotification(null);
+      notificationTimeoutRef.current = null;
+    }, 4500);
+  }
+
+  function getLatestTransactionKey(userKey) {
+    return `airtimee-latest-transaction-${userKey || "guest"}`;
+  }
+
+  function loadLatestTransaction(userKey) {
+    if (typeof window === "undefined") return null;
+    try {
+      const raw = localStorage.getItem(getLatestTransactionKey(userKey));
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function persistLatestTransaction(transaction) {
+    if (typeof window === "undefined") return;
+    try {
+      localStorage.setItem(getLatestTransactionKey(user), JSON.stringify(transaction));
+    } catch {
+      // ignore localStorage failures
+    }
+  }
+
+  function makeLatestTransaction({ id, amount, recipientPhone, buyerPhone, status, payerPhoneNumber, createdAt, updatedAt, type }) {
+    return {
+      id,
+      amount: amount ?? 0,
+      recipientPhone: recipientPhone || "",
+      buyerPhone: buyerPhone || "",
+      payerPhoneNumber: payerPhoneNumber || "",
+      status,
+      type: type || (buyerPhone ? "other" : "self"),
+      createdAt: createdAt || new Date().toISOString(),
+      updatedAt: updatedAt || new Date().toISOString(),
+    };
+  }
+
+  function saveLatestTransaction(transaction) {
+    setLatestTransaction(transaction);
+    persistLatestTransaction(transaction);
+  }
+
+  useEffect(() => {
+    setLatestTransaction(loadLatestTransaction(user));
+  }, [user]);
+
+  function handleLogin(username, password) {
+    setLoginError(null);
+    setLoginSubmitting(true);
+    if (!username.trim() || !password.trim()) {
+      setLoginError("Username and password are required.");
+      setLoginSubmitting(false);
+      return;
+    }
+    localStorage.setItem("airtimee-auth", "true");
+    localStorage.setItem("airtimee-user", username.trim());
+    setUser(username.trim());
+    setIsAuthenticated(true);
+    setLoginSubmitting(false);
+    setView(VIEWS.HOME);
+  }
+
+  function handleLogout() {
+    localStorage.removeItem("airtimee-auth");
+    localStorage.removeItem("airtimee-user");
+    setIsAuthenticated(false);
+    setUser("");
+    setView(VIEWS.HOME);
+  }
+
+  function handleNavigate(nextView) {
+    setView(nextView);
+    if (nextView === VIEWS.REDEEM) {
+      setRedeemMode(true);
+    } else if (nextView === VIEWS.BUY || nextView === VIEWS.HOME || nextView === VIEWS.ABOUT || nextView === VIEWS.SUPPORT || nextView === VIEWS.ADMIN) {
+      setRedeemMode(false);
+    }
+    const path = nextView === VIEWS.SUPPORT ? "/support" : nextView === VIEWS.ABOUT ? "/about" : nextView === VIEWS.ADMIN ? "/admin" : "/";
+    window.history.pushState(null, "", path);
+  }
 
   function handleSubmit(e) {
     e.preventDefault();
     setError(null);
 
     const amountValue = Number(amount);
-    if (!phone.trim() || !Number.isFinite(amountValue) || amountValue < 5) {
-      setError("Please enter a valid phone number and an amount of at least KES 5.");
+    if (!recipientPhone.trim() || !Number.isFinite(amountValue) || amountValue < 5) {
+      setError("Please enter a valid recipient phone number and an amount of at least KES 5.");
       return;
     }
 
@@ -123,7 +259,7 @@ export default function App() {
     setError(null);
 
     try {
-      const res = await initiatePayment(phone, Number(amount));
+      const res = await initiatePayment(recipientPhone, Number(amount), buyerPhone.trim() || undefined);
       // Tolerate both camelCase and snake_case API contracts.
       const id = res.transactionId ?? res.transaction_id;
       if (!id) {
@@ -131,11 +267,26 @@ export default function App() {
         return;
       }
       if (!mountedRef.current) return;
+      showNotification({ type: "success", message: "M-Pesa prompt sent. Approve it on your phone to complete payment." });
+      // Persist a latest transaction summary for this user.
+      saveLatestTransaction(
+        makeLatestTransaction({
+          id,
+          amount: Number(amount),
+          recipientPhone: recipientPhone.trim(),
+          buyerPhone: buyerPhone.trim(),
+          status: "PENDING_PAYMENT",
+          type: buyerPhone.trim() ? "other" : "self",
+        })
+      );
+      // Use the top-level state and polling effects to monitor status.
       setTransactionId(id);
       setStatus("PENDING_PAYMENT");
     } catch (err) {
       if (!mountedRef.current) return;
-      setError(err.response?.data?.error || "Something went wrong. Please try again.");
+      const errorMessage = err.response?.data?.error || "Something went wrong. Please try again.";
+      setError(errorMessage);
+      showNotification({ type: "error", message: errorMessage });
     } finally {
       if (mountedRef.current) setSubmitting(false);
     }
@@ -148,20 +299,57 @@ export default function App() {
     setSubmitting(true);
 
     try {
-      const data = await redeemPayment(mpesaText, phone.trim() || undefined);
+      const data = await redeemPayment(mpesaText, redeemPhone.trim() || undefined);
       if (!mountedRef.current) return;
       setRedeemResult(data);
+      const successMessage = data.success ? "Redeem succeeded. Airtime is being processed." : "Redeem request received.";
+      showNotification({ type: data.success ? "success" : "info", message: successMessage });
       // Tolerate both camelCase and snake_case API contracts.
       const id = data.transactionId ?? data.transaction_id;
+      const responseStatus = data.status ?? data.transaction_status ?? null;
       if (id) {
+        const latest = makeLatestTransaction({
+          id,
+          amount: data.amount ?? 0,
+          recipientPhone: redeemPhone.trim(),
+          buyerPhone: "",
+          status: responseStatus || "PAYMENT_RECEIVED",
+          type: "redeem",
+        });
+        saveLatestTransaction(latest);
         setTransactionId(id);
-        setStatus("PAYMENT_RECEIVED");
+        setStatus(responseStatus || "PAYMENT_RECEIVED");
       }
     } catch (err) {
       if (!mountedRef.current) return;
-      setError(err.response?.data?.error || "Could not redeem the MPesa message.");
+      const responseData = err.response?.data || null;
+      setRedeemResult(responseData);
+      if (responseData?.status) {
+        setStatus(responseData.status);
+      }
+      const errorMessage = responseData?.error || "Could not redeem the MPesa message.";
+      setError(errorMessage);
+      showNotification({ type: "error", message: errorMessage });
     } finally {
       if (mountedRef.current) setSubmitting(false);
+    }
+  }
+
+  async function handleRetryAirtime(transactionId) {
+    if (!transactionId) return;
+    setRetryMessage(null);
+    setRetrying(true);
+    try {
+      const response = await retryAirtime(transactionId);
+      const message = response.success ? "Airtime retry submitted successfully." : response.error || "Airtime retry failed.";
+      setRetryMessage(message);
+      showNotification({ type: response.success ? "success" : "error", message });
+    } catch (err) {
+      const message = err.response?.data?.error || "Airtime retry failed.";
+      setRetryMessage(message);
+      showNotification({ type: "error", message });
+    } finally {
+      setRetrying(false);
     }
   }
 
@@ -177,7 +365,36 @@ export default function App() {
         const failureReason = data.failureReason ?? data.failure_reason ?? null;
 
         if (!mountedRef.current) return;
+        if (currentStatus && currentStatus !== prevStatusRef.current) {
+          if (currentStatus === "AIRTIME_SENT") {
+            showNotification({ type: "success", message: "Airtime was delivered successfully." });
+          } else if (currentStatus === "AIRTIME_FAILED") {
+            showNotification({ type: "error", message: `Airtime delivery failed: ${failureReason || "Please retry."}` });
+          } else if (currentStatus === "PAYMENT_FAILED") {
+            showNotification({ type: "error", message: `Payment failed: ${failureReason || "Please retry."}` });
+          } else if (currentStatus === "PAYMENT_RECEIVED") {
+            showNotification({ type: "info", message: "Payment received. Delivering airtime now." });
+          }
+          prevStatusRef.current = currentStatus;
+        }
+
         setStatus(currentStatus);
+        // Keep the persisted summary in sync with live status updates.
+        if (transactionId) {
+          saveLatestTransaction(
+            makeLatestTransaction({
+              id: transactionId,
+              amount: data.amount ?? latestTransaction?.amount ?? 0,
+              recipientPhone: latestTransaction?.recipientPhone || data.phoneNumber || "",
+              buyerPhone: latestTransaction?.buyerPhone || "",
+              payerPhoneNumber: data.payerPhoneNumber || latestTransaction?.payerPhoneNumber || "",
+              status: currentStatus,
+              createdAt: latestTransaction?.createdAt,
+              updatedAt: data.updatedAt || latestTransaction?.updatedAt,
+              type: latestTransaction?.type || (latestTransaction?.buyerPhone ? "other" : "self"),
+            })
+          );
+        }
         // Clear the error when the latest poll carries no failure reason.
         setError(failureReason || null);
 
@@ -196,225 +413,475 @@ export default function App() {
     setTransactionId(null);
     setStatus(null);
     setError(null);
-    setPhone("");
+    setRecipientPhone("");
+    setBuyerPhone("");
     setAmount("");
     setMpesaText("");
+    setRedeemPhone("");
     setRedeemResult(null);
+  }
+
+  function formatLatestTransactionSummary(tx) {
+    if (!tx) return null;
+    if (tx.type === "self") {
+      return `Airtime for your own number (${tx.recipientPhone})`;
+    }
+    if (tx.type === "other") {
+      return `Airtime for ${tx.recipientPhone} paid from ${tx.buyerPhone || "your number"}`;
+    }
+    if (tx.type === "redeem") {
+      return `Redeem request for ${tx.recipientPhone || "your phone"}`;
+    }
+    return `Airtime transaction for ${tx.recipientPhone}`;
+  }
+
+  function renderLatestTransaction() {
+    if (!latestTransaction) return null;
+    return (
+      <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+        <p className="text-sm uppercase tracking-[0.24em] text-slate-400">Latest transaction</p>
+        <p className="mt-3 text-base font-semibold text-slate-900">{formatLatestTransactionSummary(latestTransaction)}</p>
+        <dl className="mt-4 grid gap-3 text-sm text-slate-600">
+          <div className="flex items-center justify-between gap-4 text-slate-700">
+            <span className="font-medium">Amount</span>
+            <span>{latestTransaction.amount ? `KES ${Number(latestTransaction.amount).toLocaleString()}` : "Unknown"}</span>
+          </div>
+          <div className="flex items-center justify-between gap-4 text-slate-700">
+            <span className="font-medium">Status</span>
+            <span className="capitalize">{latestTransaction.status?.toLowerCase().replace(/_/g, " ") || "Unknown"}</span>
+          </div>
+          {latestTransaction.payerPhoneNumber && (
+            <div className="flex items-center justify-between gap-4 text-slate-700">
+              <span className="font-medium">Payer</span>
+              <span>{latestTransaction.payerPhoneNumber}</span>
+            </div>
+          )}
+          <div className="flex items-center justify-between gap-4 text-slate-700">
+            <span className="font-medium">Updated</span>
+            <span>{new Date(latestTransaction.updatedAt).toLocaleString()}</span>
+          </div>
+        </dl>
+        <button
+          type="button"
+          onClick={() => {
+            setTransactionId(latestTransaction.id);
+            setStatus(latestTransaction.status);
+            if (view !== VIEWS.HOME) {
+              handleNavigate(VIEWS.HOME);
+            }
+          }}
+          className="mt-4 inline-flex w-full items-center justify-center rounded-3xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+        >
+          Track latest transaction
+        </button>
+      </div>
+    );
+  }
+
+  if (isAdmin) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 p-4">
+        <style>{STYLES}</style>
+        <div className="mx-auto max-w-6xl rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm uppercase tracking-[0.32em] text-teal-600">Admin dashboard</p>
+              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">AI parse review & transaction controls</h1>
+            </div>
+            <button
+              type="button"
+              onClick={() => handleNavigate(VIEWS.HOME)}
+              className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+            >
+              Buyer view
+            </button>
+          </div>
+          <AdminReviewPage />
+        </div>
+      </div>
+    );
+  }
+  if (isSupport) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 p-4">
+        <style>{STYLES}</style>
+        <div className="mx-auto max-w-6xl rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm uppercase tracking-[0.32em] text-teal-600">Support chat</p>
+              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Transaction-aware support assistant</h1>
+            </div>
+            <button
+              type="button"
+              onClick={() => handleNavigate(VIEWS.HOME)}
+              className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+            >
+              Back to buyer view
+            </button>
+          </div>
+          <SupportChat currentTransactionId={transactionId} />
+        </div>
+      </div>
+    );
+  }
+  if (isAbout) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 p-4">
+        <style>{STYLES}</style>
+        <div className="mx-auto max-w-6xl rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm uppercase tracking-[0.32em] text-teal-600">About Air-timee</p>
+              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Built for fast airtime delivery</h1>
+            </div>
+            <button
+              type="button"
+              onClick={() => handleNavigate(VIEWS.HOME)}
+              className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+            >
+              Back to home
+            </button>
+          </div>
+          <div className="space-y-6 text-slate-700">
+            <p>Air-timee helps you send airtime quickly using M-Pesa, with payment verification and support assistance all in one place.</p>
+            <p>Our platform is designed for safe airtime purchases, delivery visibility, and a support assistant that references actual transaction data.</p>
+            <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6 shadow-sm">
+              <h2 className="text-xl font-semibold text-slate-900">Why Air-timee?</h2>
+              <ul className="mt-4 space-y-3 text-slate-600 list-disc list-inside">
+                <li>Simple airtime purchase flow with M-Pesa STK push.</li>
+                <li>Automatic transaction status polling and delivery tracking.</li>
+                <li>Support chat that uses real transaction context.</li>
+                <li>Admin review tools for AI parse audits and retries.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (isLogin) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
+        <style>{STYLES}</style>
+        <div className="w-full max-w-md rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+          <div className="mb-6 text-center">
+            <p className="text-sm uppercase tracking-[0.32em] text-teal-600">Air-timee login</p>
+            <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Secure access</h1>
+          </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const form = e.target;
+              handleLogin(form.username.value, form.password.value);
+            }}
+            className="space-y-5"
+          >
+            <label className="block space-y-2">
+              <span className="text-sm font-medium text-slate-600">Username</span>
+              <input
+                name="username"
+                type="text"
+                className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+              />
+            </label>
+            <label className="block space-y-2">
+              <span className="text-sm font-medium text-slate-600">Password</span>
+              <input
+                name="password"
+                type="password"
+                className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+              />
+            </label>
+            {loginError && <p className="text-sm text-red-700">{loginError}</p>}
+            <button
+              type="submit"
+              disabled={loginSubmitting}
+              className="inline-flex w-full items-center justify-center rounded-3xl bg-teal-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-teal-500 disabled:opacity-50"
+            >
+              {loginSubmitting ? "Signing in..." : "Sign in"}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleNavigate(VIEWS.HOME)}
+              className="inline-flex w-full items-center justify-center rounded-3xl border border-slate-300 bg-white px-6 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+            >
+              Back to home
+            </button>
+          </form>
+        </div>
+      </div>
+    );
   }
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
       <style>{STYLES}</style>
+      {notification && (
+        <div
+          className={`fixed right-4 top-4 z-50 max-w-sm rounded-3xl px-4 py-3 text-sm shadow-2xl transition-all duration-150 ${
+            notification.type === "success"
+              ? "bg-emerald-600 text-white"
+              : notification.type === "error"
+              ? "bg-red-600 text-white"
+              : "bg-slate-900 text-white"
+          }`}
+        >
+          {notification.message}
+        </div>
+      )}
 
-      <div className="w-full max-w-6xl grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
-        <section className="animate-fade-in-up rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-sm uppercase tracking-[0.32em] text-teal-600">Airtime vendor</p>
-              <h1 className="mt-3 text-4xl font-semibold tracking-tight text-slate-900">Send airtime faster with M-Pesa</h1>
-            </div>
-            <div className="inline-flex items-center gap-2 rounded-3xl border border-teal-600/20 bg-teal-50 px-4 py-2 text-sm text-teal-700">
-              <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-teal-500" /> Live payment flow
+      <div className="w-full max-w-6xl space-y-6">
+        <div className="animate-fade-in-up rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <Logo />
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleNavigate(VIEWS.HOME)}
+                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.HOME ? "bg-teal-600 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+              >
+                Home
+              </button>
+              <button
+                type="button"
+                onClick={() => handleNavigate(VIEWS.BUY)}
+                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.BUY ? "bg-teal-600 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+              >
+                Buy airtime
+              </button>
+              <button
+                type="button"
+                onClick={() => handleNavigate(VIEWS.REDEEM)}
+                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.REDEEM ? "bg-teal-600 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+              >
+                Redeem
+              </button>
+              <button
+                type="button"
+                onClick={() => handleNavigate(VIEWS.SUPPORT)}
+                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.SUPPORT ? "bg-slate-900 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+              >
+                Support
+              </button>
+              <button
+                type="button"
+                onClick={() => handleNavigate(VIEWS.ABOUT)}
+                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.ABOUT ? "bg-slate-900 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+              >
+                About
+              </button>
+              {isAuthenticated ? (
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="rounded-full bg-red-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-500"
+                >
+                  Logout
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleNavigate(VIEWS.LOGIN)}
+                  className="rounded-full bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+                >
+                  Login
+                </button>
+              )}
             </div>
           </div>
-
-          <div className="mt-4 max-w-2xl text-slate-500">Enter the customer phone, choose an amount, and approve the M-Pesa prompt. The app handles airtime delivery automatically once payment is confirmed.</div>
-
-          <div className="mt-6 flex flex-wrap gap-3">
-            <button
-              type="button"
-              onClick={() => setRedeemMode(false)}
-              className={`rounded-full px-4 py-2 text-sm font-semibold transition ${redeemMode ? "border border-slate-300 bg-white text-slate-600" : "bg-teal-600 text-white"}`}
-            >
-              Buy airtime
-            </button>
-            <button
-              type="button"
-              onClick={() => setRedeemMode(true)}
-              className={`rounded-full px-4 py-2 text-sm font-semibold transition ${redeemMode ? "bg-teal-600 text-white" : "border border-slate-300 bg-white text-slate-600"}`}
-            >
-              Redeem MPesa message
-            </button>
+          <div className="mt-4 rounded-[24px] border border-slate-200 bg-slate-50 p-5 text-slate-600">
+            <p className="text-sm">Air-timee is your M-Pesa airtime partner for fast, secure top-ups with builtin support and admin tools.</p>
           </div>
+        </div>
 
-          {redeemMode ? (
-            <form onSubmit={handleRedeem} className="mt-8 space-y-6">
-              <div>
-                <label className="space-y-2">
-                  <span className="text-sm font-medium text-slate-600">MPesa SMS / message text</span>
-                  <textarea
-                    required
-                    rows={8}
-                    value={mpesaText}
-                    onChange={(e) => setMpesaText(e.target.value)}
-                    className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
-                    placeholder="Paste the MPesa message body here"
-                  />
-                </label>
-              </div>
-
-              <div className="grid gap-5 sm:grid-cols-2">
-                <label className="space-y-2">
-                  <span className="text-sm font-medium text-slate-600">Optional phone number</span>
-                  <input
-                    type="tel"
-                    placeholder="07XXXXXXXX"
-                    value={phone}
-                    onChange={(e) => setPhone(e.target.value)}
-                    className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
-                  />
-                </label>
-                <div className="rounded-[24px] border border-teal-600/10 bg-slate-50 p-4 text-sm text-slate-600 shadow-inner">
-                  <p className="font-medium text-slate-900">How this works</p>
-                  <p className="mt-2 text-slate-500">Upload your MPesa receipt text and optionally the recipient phone number. We will verify the payment and send airtime automatically.</p>
+        {isHome && (
+          <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
+            <section className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+              <div className="space-y-6">
+                <h2 className="text-3xl font-semibold text-slate-900">Welcome to Air-timee</h2>
+                <p className="text-slate-600">Use Air-timee to send airtime safely via M-Pesa or redeem a receipt instantly. Our support assistant can also help you with transaction questions.</p>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
+                    <h3 className="text-xl font-semibold text-slate-900">Fast checkout</h3>
+                    <p className="mt-2 text-slate-600">Create a payment request and approve the M-Pesa prompt within seconds.</p>
+                  </div>
+                  <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
+                    <h3 className="text-xl font-semibold text-slate-900">Verify payments</h3>
+                    <p className="mt-2 text-slate-600">Track your transaction status in real time and recover from stuck or failed payments.</p>
+                  </div>
                 </div>
               </div>
+            </section>
+            <aside className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+              <h3 className="text-xl font-semibold text-slate-900">Your account</h3>
+              <p className="mt-3 text-slate-600">{isAuthenticated ? `Signed in as ${user}` : "You are not logged in."}</p>
+              {renderLatestTransaction()}
+              <div className="mt-6 space-y-3 rounded-3xl border border-teal-600/10 bg-teal-50 p-5 text-slate-700">
+                <p className="font-semibold text-slate-900">Getting started</p>
+                <ul className="list-disc space-y-2 pl-5 text-slate-600">
+                  <li>Buy airtime with a recipient phone number.</li>
+                  <li>Redeem a valid M-Pesa receipt message.</li>
+                  <li>Use Support if you need help or have issues.</li>
+                </ul>
+              </div>
+            </aside>
+          </div>
+        )}
 
-              {error && <p className="animate-fade-in-up rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
-              {redeemResult && (
-                <p className={`animate-fade-in-up rounded-3xl px-4 py-3 text-sm ${redeemResult.success ? "border border-emerald-300 bg-emerald-50 text-emerald-700" : "border border-red-200 bg-red-50 text-red-700"}`}>
-                  {redeemResult.message || (redeemResult.success ? "Redeem request submitted." : "Redeem request failed.")}
-                </p>
-              )}
-
-              <button
-                type="submit"
-                disabled={submitting}
-                className="inline-flex w-full items-center justify-center gap-3 rounded-3xl bg-teal-600 px-6 py-4 text-base font-semibold text-white shadow-xl shadow-teal-600/20 transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {submitting ? (
-                  <>
-                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border-2 border-white border-t-transparent text-white animate-spin" />
-                    Claim airtime
-                  </>
-                ) : (
-                  "Claim airtime"
-                )}
-              </button>
-            </form>
-          ) : !transactionId ? (
-            <>
-              <form onSubmit={handleSubmit} className="mt-8 space-y-6">
-                <div className="grid gap-5 sm:grid-cols-2">
+        {isBuy && (
+          <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
+            <section className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+              <div className="space-y-4">
+                <h2 className="text-3xl font-semibold text-slate-900">Buy airtime</h2>
+                <p className="text-slate-600">Enter the recipient phone and amount to start a top-up with M-Pesa.</p>
+                <form onSubmit={handleSubmit} className="space-y-6">
+                  <div className="grid gap-5 sm:grid-cols-2">
+                    <label className="space-y-2">
+                      <span className="text-sm font-medium text-slate-600">Recipient phone number</span>
+                      <input
+                        type="tel"
+                        required
+                        placeholder="07XXXXXXXX"
+                        value={recipientPhone}
+                        onChange={(e) => setRecipientPhone(e.target.value)}
+                        className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                      />
+                    </label>
+                    <label className="space-y-2">
+                      <span className="text-sm font-medium text-slate-600">Amount (KES)</span>
+                      <input
+                        type="number"
+                        required
+                        min={5}
+                        placeholder="100"
+                        value={amount}
+                        onChange={(e) => setAmount(e.target.value)}
+                        className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                      />
+                    </label>
+                  </div>
                   <label className="space-y-2">
-                    <span className="text-sm font-medium text-slate-600">Phone number</span>
+                    <span className="text-sm font-medium text-slate-600">Your phone number (M-Pesa prompt recipient)</span>
                     <input
                       type="tel"
-                      required
                       placeholder="07XXXXXXXX"
-                      value={phone}
-                      onChange={(e) => setPhone(e.target.value)}
+                      value={buyerPhone}
+                      onChange={(e) => setBuyerPhone(e.target.value)}
                       className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                    />
+                    <p className="mt-2 text-sm text-slate-500">Leave blank to send the prompt to the recipient number.</p>
+                  </label>
+                  {error && <p className="animate-fade-in-up rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="inline-flex w-full items-center justify-center gap-3 rounded-3xl bg-teal-600 px-6 py-4 text-base font-semibold text-white shadow-xl shadow-teal-600/20 transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {submitting ? (
+                      <>
+                        <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border-2 border-white border-t-transparent text-white animate-spin" />
+                        Sending M-Pesa prompt...
+                      </>
+                    ) : (
+                      "Review and confirm"
+                    )}
+                  </button>
+                </form>
+              </div>
+            </section>
+            <aside className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+              <h3 className="text-xl font-semibold text-slate-900">Why use buy mode?</h3>
+              <p className="mt-3 text-slate-600">Use this view when you want to send airtime to someone else and optionally receive the STK prompt on your own number.</p>
+            </aside>
+          </div>
+        )}
+
+        {isRedeem && (
+          <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
+            <section className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+              <div className="space-y-4">
+                <h2 className="text-3xl font-semibold text-slate-900">Redeem M-Pesa receipt</h2>
+                <p className="text-slate-600">Paste your M-Pesa SMS text and we will verify it before crediting airtime.</p>
+                <form onSubmit={handleRedeem} className="space-y-6">
+                  <label className="space-y-2">
+                    <span className="text-sm font-medium text-slate-600">MPesa SMS / message text</span>
+                    <textarea
+                      required
+                      rows={8}
+                      value={mpesaText}
+                      onChange={(e) => setMpesaText(e.target.value)}
+                      className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                      placeholder="Paste the MPesa message body here"
                     />
                   </label>
                   <label className="space-y-2">
-                    <span className="text-sm font-medium text-slate-600">Amount (KES)</span>
+                    <span className="text-sm font-medium text-slate-600">Optional phone number</span>
                     <input
-                      type="number"
-                      required
-                      min={5}
-                      placeholder="100"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
+                      type="tel"
+                      placeholder="07XXXXXXXX"
+                      value={redeemPhone}
+                      onChange={(e) => setRedeemPhone(e.target.value)}
                       className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
                     />
                   </label>
-                </div>
-
-                {error && <p className="animate-fade-in-up rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
-
-                {phone.trim() && amount.trim() && Number(amount) > 0 && (
-                  <div className="animate-fade-in-up rounded-[24px] border border-teal-600/10 bg-slate-50 p-4 text-sm text-slate-600 shadow-inner">
-                    <div className="flex items-center justify-between gap-4">
-                      <div>
-                        <p className="font-medium text-slate-900">Preview</p>
-                        <p className="mt-1 text-slate-500">Review the airtime purchase before sending the M-Pesa prompt.</p>
-                      </div>
-                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs uppercase tracking-[0.24em] text-slate-500">Preview</span>
-                    </div>
-                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                      <div className="rounded-3xl bg-white p-4">
-                        <p className="text-xs uppercase tracking-[0.28em] text-slate-400">Phone</p>
-                        <p className="mt-2 text-lg font-semibold text-slate-900">{phone}</p>
-                      </div>
-                      <div className="rounded-3xl bg-white p-4">
-                        <p className="text-xs uppercase tracking-[0.28em] text-slate-400">Amount</p>
-                        <p className="mt-2 text-lg font-semibold text-slate-900">KES {Number(amount).toLocaleString()}</p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="inline-flex w-full items-center justify-center gap-3 rounded-3xl bg-teal-600 px-6 py-4 text-base font-semibold text-white shadow-xl shadow-teal-600/20 transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {submitting ? (
-                    <>
-                      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border-2 border-white border-t-transparent text-white animate-spin" />
-                      Sending M-Pesa prompt...
-                    </>
-                  ) : (
-                    "Review and confirm"
-                  )}
-                </button>
-              </form>
-
-              {showConfirm && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
-                  <div className="animate-modal-in w-full max-w-md rounded-[32px] border border-slate-200 bg-white p-6 shadow-2xl">
-                    <h2 className="text-2xl font-semibold text-slate-900">Confirm airtime purchase</h2>
-                    <p className="mt-3 text-slate-500">Please confirm you want to send airtime to the following number.</p>
-
-                    <div className="mt-6 space-y-4 rounded-[24px] border border-teal-600/10 bg-slate-50 p-4">
-                      <div className="flex items-center justify-between gap-4">
-                        <span className="text-sm text-slate-500">Phone</span>
-                        <span className="font-semibold text-slate-900">{phone}</span>
-                      </div>
-                      <div className="flex items-center justify-between gap-4">
-                        <span className="text-sm text-slate-500">Amount</span>
-                        <span className="font-semibold text-slate-900">KES {Number(amount).toLocaleString()}</span>
-                      </div>
-                    </div>
-
-                    <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
-                      <button
-                        type="button"
-                        onClick={() => setShowConfirm(false)}
-                        className="rounded-3xl border border-slate-300 px-5 py-3 text-sm text-slate-600 transition hover:bg-slate-100"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={confirmPayment}
-                        className="rounded-3xl bg-teal-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-teal-500"
-                      >
-                        Confirm purchase
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </>
-          ) : (
-            <StatusPanel key={status || "none"} status={status} error={error} onReset={resetForm} />
-          )}
-        </section>
-
-        <aside className="animate-fade-in-up rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl" style={{ animationDelay: "80ms" }}>
-          <div className="space-y-5">
-            <div>
-              <p className="text-sm uppercase tracking-[0.32em] text-slate-400">Live status</p>
-              <h2 className="mt-3 text-2xl font-semibold text-slate-900">Visual delivery experience</h2>
-              <p className="mt-2 text-sm text-slate-500">See the current step and the airtime transfer animation based on payment progress.</p>
-            </div>
-
-            <ProgressSteps status={status} />
-            <DeliveryAnimation status={status} />
+                  {error && <p className="animate-fade-in-up rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="inline-flex w-full items-center justify-center gap-3 rounded-3xl bg-teal-600 px-6 py-4 text-base font-semibold text-white shadow-xl shadow-teal-600/20 transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {submitting ? (
+                      <>
+                        <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border-2 border-white border-t-transparent text-white animate-spin" />
+                        Claim airtime
+                      </>
+                    ) : (
+                      "Claim airtime"
+                    )}
+                  </button>
+                </form>
+              </div>
+            </section>
+            <aside className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+              <h3 className="text-xl font-semibold text-slate-900">Redeem flow</h3>
+              <p className="mt-3 text-slate-600">Use this mode when you already have a valid M-Pesa receipt text to convert into airtime.</p>
+            </aside>
           </div>
-        </aside>
+        )}
+
+        {isSupport && (
+          <div className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+            <SupportChat currentTransactionId={transactionId} />
+          </div>
+        )}
+
+        {isAbout && (
+          <div className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+            <div className="space-y-6">
+              <h2 className="text-3xl font-semibold text-slate-900">About Air-timee</h2>
+              <p className="text-slate-600">Air-timee is a lightweight M-Pesa airtime vending platform with payment tracking, redemption support, and an admin dashboard for operations.</p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
+                  <h3 className="text-xl font-semibold text-slate-900">Mission</h3>
+                  <p className="mt-2 text-slate-600">Make airtime top-up easy, transparent, and reliable for buyers and operators.</p>
+                </div>
+                <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
+                  <h3 className="text-xl font-semibold text-slate-900">Security</h3>
+                  <p className="mt-2 text-slate-600">Protected access and environment-based secrets keep your service safe in production.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isBuy || isRedeem ? (
+          <div className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+            <div className="space-y-5">
+              <ProgressSteps status={status} />
+              <DeliveryAnimation status={status} />
+            </div>
+          </div>
+        ) : null}
       </div>
     </div>
   );

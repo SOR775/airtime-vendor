@@ -204,6 +204,10 @@ async function initiateSTKPush({ phone, amount, accountReference, transactionDes
     { headers: { Authorization: `Bearer ${token}` } }
   );
 
+  if (!data || Number(data.ResponseCode) !== 0) {
+    throw new Error(`STK push failed: ${data?.ResponseDescription || JSON.stringify(data)}`);
+  }
+
   // data looks like:
   // { MerchantRequestID, CheckoutRequestID, ResponseCode, ResponseDescription, CustomerMessage }
   return data;

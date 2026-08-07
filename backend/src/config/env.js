@@ -31,4 +31,13 @@ module.exports = {
 
   jwtSecret: process.env.JWT_SECRET,
   webhookSharedSecret: process.env.WEBHOOK_SHARED_SECRET,
+  
+  // Minimum amount supported by the configured airtime provider. If a
+  // requested amount is lower during development, the service may fall
+  // back to the mock provider to avoid provider validation errors.
+  airtimeMinAmount: Number(process.env.AIRTIME_MIN_AMOUNT || 5),
+
+  // Artificial intelligence service
+  claudeApiKey: process.env.CLAUDE_API_KEY,
+  claudeModel: process.env.CLAUDE_MODEL || "claude-3.5-mini",
 };

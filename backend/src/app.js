@@ -4,6 +4,8 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 
 const paymentRoutes = require("./routes/payment.routes");
+const aiRoutes = require("./routes/ai.routes");
+const adminRoutes = require("./routes/admin.routes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -17,7 +19,12 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 app.use("/api/payments", paymentRoutes);
+app.use("/api/ai", aiRoutes);
+app.use("/api/admin", adminRoutes);
 
 app.use(errorHandler);
 
 module.exports = app;
+
+
+
