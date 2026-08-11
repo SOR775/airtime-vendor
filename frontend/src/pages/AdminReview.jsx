@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
 
+function authHeaders() {
+  const token = localStorage.getItem("airtimee-token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 function renderValue(value) {
   if (value === null || value === undefined) {
     return <span className="text-slate-500">—</span>;
@@ -39,9 +44,10 @@ export default function AdminReviewPage() {
   async function fetchAll() {
     setLoading(true);
     try {
+      const headers = authHeaders();
       const [txRes, parseRes] = await Promise.all([
-        fetch('/api/admin/transactions'),
-        fetch('/api/admin/ai-parses?limit=50'),
+        fetch('/api/admin/transactions', { headers }),
+        fetch('/api/admin/ai-parses?limit=50', { headers }),
       ]);
       const [txData, parseData] = await Promise.all([txRes.json(), parseRes.json()]);
       setTxs(txData);

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { initiatePayment, getTransactionStatus, redeemPayment, retryAirtime } from "./services/api";
+import { initiatePayment, getTransactionStatus, redeemPayment, retryAirtime, login as apiLogin, initiateRegister as apiInitiateRegister, verifyRegister as apiVerifyRegister, setAuthToken } from "./services/api";
 import AdminReviewPage from "./pages/AdminReview.jsx";
 import SupportChat from "./pages/SupportChat.jsx";
 import Logo from "./components/Logo.jsx";
@@ -22,12 +22,105 @@ const STATUS_STEP = {
   REFUNDED: 3,
 };
 
-/* ── Custom animation keyframes ──
-   `animate-credit-fly` / `animate-bounce-slow` / `animate-shake` are NOT
-   Tailwind utilities, so without these they never run. Defined here so the
-   component works anywhere; prefer moving to tailwind.config.js if you
-   standardize them globally. */
+/* ── Style layer ──
+   Two parts: (1) a small design-system (`.air-shell`, `.air-card`,
+   `.btn-primary`, `.field`, ...) so repeated patterns stay consistent,
+   and (2) the custom animation keyframes. The `animate-*` utilities are
+   NOT Tailwind classes, so they are defined here; prefer moving the
+   shared pieces to a global stylesheet / tailwind.config.js if you
+   standardize them across the app. */
 const STYLES = `
+  /* ── Design system ── */
+  .air-shell {
+    min-height: 100vh;
+    background:
+      radial-gradient(60rem 30rem at 85% -10%, rgba(45, 212, 191, 0.10), transparent 60%),
+      radial-gradient(50rem 26rem at -10% 10%, rgba(16, 185, 129, 0.08), transparent 55%),
+      #f1f5f9;
+  }
+  .air-card {
+    border-radius: 28px;
+    border: 1px solid rgba(15, 23, 42, 0.08);
+    background: #ffffff;
+    box-shadow: 0 12px 40px -18px rgba(15, 23, 42, 0.16);
+  }
+  .air-kicker {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: #0d9488;
+  }
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 9999px;
+    padding: 0.85rem 1.5rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #ffffff;
+    background: linear-gradient(135deg, #0d9488, #059669);
+    box-shadow: 0 10px 24px -10px rgba(13, 148, 136, 0.55);
+    transition: transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+  }
+  .btn-primary:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 14px 30px -10px rgba(13, 148, 136, 0.6);
+    filter: brightness(1.04);
+  }
+  .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 9999px;
+    border: 1px solid rgba(15, 23, 42, 0.12);
+    background: #ffffff;
+    padding: 0.7rem 1.25rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #334155;
+    transition: background 0.2s ease, border-color 0.2s ease;
+  }
+  .btn-ghost:hover { background: #f8fafc; border-color: rgba(15, 23, 42, 0.22); }
+  .btn-dark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 9999px;
+    padding: 0.7rem 1.25rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #ffffff;
+    background: #0f172a;
+    transition: background 0.2s ease, transform 0.2s ease;
+  }
+  .btn-dark:hover { background: #1e293b; }
+  .field {
+    width: 100%;
+    border-radius: 18px;
+    border: 1px solid rgba(15, 23, 42, 0.14);
+    background: #ffffff;
+    padding: 0.8rem 1rem;
+    font-size: 0.95rem;
+    color: #0f172a;
+    outline: none;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  .field::placeholder { color: #94a3b8; }
+  .field:focus { border-color: #14b8a6; box-shadow: 0 0 0 4px rgba(20, 184, 166, 0.15); }
+  .nav-pill {
+    border-radius: 9999px;
+    padding: 0.55rem 1.1rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: all 0.2s ease;
+  }
+
+  /* ── Custom animation keyframes ── */
   @keyframes credit-fly {
     0%   { transform: translateY(0) scale(.5); opacity: 0; }
     15%  { opacity: 1; }
@@ -75,6 +168,12 @@ const STYLES = `
   }
   .animate-modal-in { animation: modal-in .3s cubic-bezier(.16,1,.3,1) both; }
 
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateX(24px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+  .animate-toast-in { animation: toast-in .3s cubic-bezier(.16,1,.3,1) both; }
+
   @media (prefers-reduced-motion: reduce) {
     .animate-credit-fly,
     .animate-bounce-slow,
@@ -82,11 +181,24 @@ const STYLES = `
     .animate-progress-slide,
     .animate-pop-in,
     .animate-fade-in-up,
-    .animate-modal-in {
+    .animate-modal-in,
+    .animate-toast-in {
       animation: none !important;
     }
   }
 `;
+
+/* Small helper for the status pill shown in the "Latest transaction" card.
+   Colors carry meaning: waiting = amber, processing = teal, success = green,
+   failure = red, refunded = neutral. */
+function statusPillClass(status) {
+  if (!status) return "bg-slate-100 text-slate-600 ring-slate-200";
+  if (status === "PENDING_PAYMENT") return "bg-amber-50 text-amber-700 ring-amber-200";
+  if (status === "PAYMENT_RECEIVED") return "bg-teal-50 text-teal-700 ring-teal-200";
+  if (status === "AIRTIME_SENT") return "bg-emerald-50 text-emerald-700 ring-emerald-200";
+  if (status === "REFUNDED") return "bg-slate-100 text-slate-600 ring-slate-300";
+  return "bg-red-50 text-red-700 ring-red-200"; // AIRTIME_FAILED / PAYMENT_FAILED
+}
 
 export default function App() {
   const [recipientPhone, setRecipientPhone] = useState("");
@@ -108,13 +220,21 @@ export default function App() {
     ABOUT: "about",
     LOGIN: "login",
   };
+  const [token, setToken] = useState(() => localStorage.getItem("airtimee-token") || "");
+  const [isAuthenticated, setIsAuthenticated] = useState(() => Boolean(localStorage.getItem("airtimee-token")));
+  const [user, setUser] = useState(() => localStorage.getItem("airtimee-user") || "");
   const [view, setView] = useState(() => {
     const path = window.location.pathname;
-    if (path === "/admin") return VIEWS.ADMIN;
-    if (path === "/support") return VIEWS.SUPPORT;
-    if (path === "/about") return VIEWS.ABOUT;
-    return VIEWS.HOME;
+    const requestedView = path === "/admin" ? VIEWS.ADMIN : path === "/support" ? VIEWS.SUPPORT : path === "/about" ? VIEWS.ABOUT : path === "/login" ? VIEWS.LOGIN : VIEWS.HOME;
+    return Boolean(localStorage.getItem("airtimee-token")) ? requestedView : VIEWS.LOGIN;
   });
+
+  useEffect(() => {
+    if (!isAuthenticated && view !== VIEWS.LOGIN) {
+      setView(VIEWS.LOGIN);
+      window.history.replaceState(null, "", "/login");
+    }
+  }, [isAuthenticated, view]);
   const isHome = view === VIEWS.HOME;
   const isBuy = view === VIEWS.BUY;
   const isRedeem = view === VIEWS.REDEEM;
@@ -122,10 +242,13 @@ export default function App() {
   const isAbout = view === VIEWS.ABOUT;
   const isAdmin = view === VIEWS.ADMIN;
   const isLogin = view === VIEWS.LOGIN;
-  const [isAuthenticated, setIsAuthenticated] = useState(() => localStorage.getItem("airtimee-auth") === "true");
-  const [user, setUser] = useState(() => localStorage.getItem("airtimee-user") || "");
   const [loginError, setLoginError] = useState(null);
   const [loginSubmitting, setLoginSubmitting] = useState(false);
+  const [registerMode, setRegisterMode] = useState(false);
+  const [pendingOtp, setPendingOtp] = useState(false);
+  const [otpCode, setOtpCode] = useState("");
+  const [registerPendingEmail, setRegisterPendingEmail] = useState("");
+  const [registerPendingPassword, setRegisterPendingPassword] = useState("");
   const [mpesaText, setMpesaText] = useState("");
   const [redeemResult, setRedeemResult] = useState(null);
   const [redeemPhone, setRedeemPhone] = useState("");
@@ -139,6 +262,10 @@ export default function App() {
 
   useEffect(() => {
     mountedRef.current = true;
+    const storedToken = localStorage.getItem("airtimee-token");
+    if (storedToken) {
+      setAuthToken(storedToken);
+    }
     return () => {
       mountedRef.current = false;
       if (notificationTimeoutRef.current) {
@@ -205,7 +332,7 @@ export default function App() {
     setLatestTransaction(loadLatestTransaction(user));
   }, [user]);
 
-  function handleLogin(username, password) {
+  async function handleLogin(username, password) {
     setLoginError(null);
     setLoginSubmitting(true);
     if (!username.trim() || !password.trim()) {
@@ -213,30 +340,102 @@ export default function App() {
       setLoginSubmitting(false);
       return;
     }
-    localStorage.setItem("airtimee-auth", "true");
-    localStorage.setItem("airtimee-user", username.trim());
-    setUser(username.trim());
-    setIsAuthenticated(true);
-    setLoginSubmitting(false);
-    setView(VIEWS.HOME);
+
+    try {
+      const data = await apiLogin(username.trim(), password);
+      const tokenValue = data.token;
+      localStorage.setItem("airtimee-token", tokenValue);
+      localStorage.setItem("airtimee-user", data.user.username);
+      setAuthToken(tokenValue);
+      setToken(tokenValue);
+      setUser(data.user.username);
+      setIsAuthenticated(true);
+      setView(VIEWS.HOME);
+    } catch (err) {
+      const errorMessage = err.response?.data?.error || "Invalid username or password.";
+      setLoginError(errorMessage);
+    } finally {
+      setLoginSubmitting(false);
+    }
+  }
+
+  async function handleRegister(username, password) {
+    // Two-step: (1) initiateRegister -> sends OTP (or returns dev OTP), (2) verifyRegister -> returns token
+    setLoginError(null);
+    setLoginSubmitting(true);
+    if (!username.trim() || !password.trim()) {
+      setLoginError("Username and password are required.");
+      setLoginSubmitting(false);
+      return;
+    }
+
+    try {
+      const data = await apiInitiateRegister(username.trim(), password);
+      setRegisterPendingEmail(username.trim());
+      setRegisterPendingPassword(password);
+      if (data.otp) {
+        setOtpCode(String(data.otp));
+        showNotification({ type: "info", message: `Dev OTP: ${data.otp}` });
+      }
+      setPendingOtp(true);
+    } catch (err) {
+      const errorMessage = err.response?.data?.error || "Could not initiate registration.";
+      setLoginError(errorMessage);
+    } finally {
+      setLoginSubmitting(false);
+    }
+  }
+
+  async function handleVerifyOtp() {
+    setLoginError(null);
+    setLoginSubmitting(true);
+    try {
+      const data = await apiVerifyRegister(registerPendingEmail, otpCode);
+      const tokenValue = data.token;
+      localStorage.setItem("airtimee-token", tokenValue);
+      localStorage.setItem("airtimee-user", data.user.username);
+      setAuthToken(tokenValue);
+      setToken(tokenValue);
+      setUser(data.user.username);
+      setIsAuthenticated(true);
+      setPendingOtp(false);
+      setRegisterPendingEmail("");
+      setRegisterPendingPassword("");
+      setOtpCode("");
+      setView(VIEWS.HOME);
+    } catch (err) {
+      const errorMessage = err.response?.data?.error || "Invalid OTP code.";
+      setLoginError(errorMessage);
+    } finally {
+      setLoginSubmitting(false);
+    }
   }
 
   function handleLogout() {
-    localStorage.removeItem("airtimee-auth");
+    localStorage.removeItem("airtimee-token");
     localStorage.removeItem("airtimee-user");
+    setAuthToken(null);
+    setToken("");
     setIsAuthenticated(false);
     setUser("");
-    setView(VIEWS.HOME);
+    setView(VIEWS.LOGIN);
+    window.history.pushState(null, "", "/login");
   }
 
   function handleNavigate(nextView) {
+    if (!isAuthenticated && nextView !== VIEWS.LOGIN) {
+      setView(VIEWS.LOGIN);
+      window.history.pushState(null, "", "/login");
+      return;
+    }
+
     setView(nextView);
     if (nextView === VIEWS.REDEEM) {
       setRedeemMode(true);
     } else if (nextView === VIEWS.BUY || nextView === VIEWS.HOME || nextView === VIEWS.ABOUT || nextView === VIEWS.SUPPORT || nextView === VIEWS.ADMIN) {
       setRedeemMode(false);
     }
-    const path = nextView === VIEWS.SUPPORT ? "/support" : nextView === VIEWS.ABOUT ? "/about" : nextView === VIEWS.ADMIN ? "/admin" : "/";
+    const path = nextView === VIEWS.SUPPORT ? "/support" : nextView === VIEWS.ABOUT ? "/about" : nextView === VIEWS.ADMIN ? "/admin" : nextView === VIEWS.LOGIN ? "/login" : "/";
     window.history.pushState(null, "", path);
   }
 
@@ -438,60 +637,65 @@ export default function App() {
   function renderLatestTransaction() {
     if (!latestTransaction) return null;
     return (
-      <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-        <p className="text-sm uppercase tracking-[0.24em] text-slate-400">Latest transaction</p>
-        <p className="mt-3 text-base font-semibold text-slate-900">{formatLatestTransactionSummary(latestTransaction)}</p>
-        <dl className="mt-4 grid gap-3 text-sm text-slate-600">
-          <div className="flex items-center justify-between gap-4 text-slate-700">
-            <span className="font-medium">Amount</span>
-            <span>{latestTransaction.amount ? `KES ${Number(latestTransaction.amount).toLocaleString()}` : "Unknown"}</span>
+      <div className="mt-5 overflow-hidden rounded-[24px] border border-slate-200/80 bg-white shadow-sm">
+        <div className="border-b border-slate-100 px-5 py-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-400">Latest transaction</p>
+            <span className={`rounded-full px-3 py-1 text-xs font-semibold capitalize ring-1 ${statusPillClass(latestTransaction.status)}`}>
+              {latestTransaction.status?.toLowerCase().replace(/_/g, " ") || "Unknown"}
+            </span>
           </div>
-          <div className="flex items-center justify-between gap-4 text-slate-700">
-            <span className="font-medium">Status</span>
-            <span className="capitalize">{latestTransaction.status?.toLowerCase().replace(/_/g, " ") || "Unknown"}</span>
+          <p className="mt-2 text-base font-semibold text-slate-900">{formatLatestTransactionSummary(latestTransaction)}</p>
+        </div>
+        <dl className="grid gap-3 px-5 py-4 text-sm text-slate-600">
+          <div className="flex items-center justify-between gap-4">
+            <span className="font-medium text-slate-500">Amount</span>
+            <span className="font-semibold text-slate-900">{latestTransaction.amount ? `KES ${Number(latestTransaction.amount).toLocaleString()}` : "Unknown"}</span>
           </div>
           {latestTransaction.payerPhoneNumber && (
-            <div className="flex items-center justify-between gap-4 text-slate-700">
-              <span className="font-medium">Payer</span>
-              <span>{latestTransaction.payerPhoneNumber}</span>
+            <div className="flex items-center justify-between gap-4">
+              <span className="font-medium text-slate-500">Payer</span>
+              <span className="text-slate-700">{latestTransaction.payerPhoneNumber}</span>
             </div>
           )}
-          <div className="flex items-center justify-between gap-4 text-slate-700">
-            <span className="font-medium">Updated</span>
-            <span>{new Date(latestTransaction.updatedAt).toLocaleString()}</span>
+          <div className="flex items-center justify-between gap-4">
+            <span className="font-medium text-slate-500">Updated</span>
+            <span className="text-slate-700">{new Date(latestTransaction.updatedAt).toLocaleString()}</span>
           </div>
         </dl>
-        <button
-          type="button"
-          onClick={() => {
-            setTransactionId(latestTransaction.id);
-            setStatus(latestTransaction.status);
-            if (view !== VIEWS.HOME) {
-              handleNavigate(VIEWS.HOME);
-            }
-          }}
-          className="mt-4 inline-flex w-full items-center justify-center rounded-3xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
-        >
-          Track latest transaction
-        </button>
+        <div className="px-5 pb-5">
+          <button
+            type="button"
+            onClick={() => {
+              setTransactionId(latestTransaction.id);
+              setStatus(latestTransaction.status);
+              if (view !== VIEWS.HOME) {
+                handleNavigate(VIEWS.HOME);
+              }
+            }}
+            className="btn-dark w-full"
+          >
+            Track latest transaction
+          </button>
+        </div>
       </div>
     );
   }
 
   if (isAdmin) {
     return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 p-4">
+      <div className="air-shell p-4 text-slate-900">
         <style>{STYLES}</style>
-        <div className="mx-auto max-w-6xl rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
+        <div className="air-card mx-auto max-w-6xl p-6 md:p-8">
           <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-sm uppercase tracking-[0.32em] text-teal-600">Admin dashboard</p>
-              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">AI parse review & transaction controls</h1>
+              <p className="air-kicker">Admin dashboard</p>
+              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">AI parse review &amp; transaction controls</h1>
             </div>
             <button
               type="button"
               onClick={() => handleNavigate(VIEWS.HOME)}
-              className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+              className="btn-dark"
             >
               Buyer view
             </button>
@@ -503,18 +707,18 @@ export default function App() {
   }
   if (isSupport) {
     return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 p-4">
+      <div className="air-shell p-4 text-slate-900">
         <style>{STYLES}</style>
-        <div className="mx-auto max-w-6xl rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
+        <div className="air-card mx-auto max-w-6xl p-6 md:p-8">
           <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-sm uppercase tracking-[0.32em] text-teal-600">Support chat</p>
+              <p className="air-kicker">Support chat</p>
               <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Transaction-aware support assistant</h1>
             </div>
             <button
               type="button"
               onClick={() => handleNavigate(VIEWS.HOME)}
-              className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+              className="btn-dark"
             >
               Back to buyer view
             </button>
@@ -526,18 +730,18 @@ export default function App() {
   }
   if (isAbout) {
     return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 p-4">
+      <div className="air-shell p-4 text-slate-900">
         <style>{STYLES}</style>
-        <div className="mx-auto max-w-6xl rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
+        <div className="air-card mx-auto max-w-6xl p-6 md:p-8">
           <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-sm uppercase tracking-[0.32em] text-teal-600">About Air-timee</p>
+              <p className="air-kicker">About Air-timee</p>
               <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Built for fast airtime delivery</h1>
             </div>
             <button
               type="button"
               onClick={() => handleNavigate(VIEWS.HOME)}
-              className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+              className="btn-dark"
             >
               Back to home
             </button>
@@ -545,13 +749,25 @@ export default function App() {
           <div className="space-y-6 text-slate-700">
             <p>Air-timee helps you send airtime quickly using M-Pesa, with payment verification and support assistance all in one place.</p>
             <p>Our platform is designed for safe airtime purchases, delivery visibility, and a support assistant that references actual transaction data.</p>
-            <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6 shadow-sm">
+            <div className="rounded-3xl border border-slate-200/80 bg-gradient-to-br from-slate-50 to-teal-50/50 p-6 shadow-sm">
               <h2 className="text-xl font-semibold text-slate-900">Why Air-timee?</h2>
-              <ul className="mt-4 space-y-3 text-slate-600 list-disc list-inside">
-                <li>Simple airtime purchase flow with M-Pesa STK push.</li>
-                <li>Automatic transaction status polling and delivery tracking.</li>
-                <li>Support chat that uses real transaction context.</li>
-                <li>Admin review tools for AI parse audits and retries.</li>
+              <ul className="mt-4 space-y-3 text-slate-600">
+                <li className="flex items-start gap-3">
+                  <span className="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full bg-teal-600/10 text-xs font-bold text-teal-700">1</span>
+                  Simple airtime purchase flow with M-Pesa STK push.
+                </li>
+                <li className="flex items-start gap-3">
+                  <span className="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full bg-teal-600/10 text-xs font-bold text-teal-700">2</span>
+                  Automatic transaction status polling and delivery tracking.
+                </li>
+                <li className="flex items-start gap-3">
+                  <span className="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full bg-teal-600/10 text-xs font-bold text-teal-700">3</span>
+                  Support chat that uses real transaction context.
+                </li>
+                <li className="flex items-start gap-3">
+                  <span className="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full bg-teal-600/10 text-xs font-bold text-teal-700">4</span>
+                  Admin review tools for AI parse audits and retries.
+                </li>
               </ul>
             </div>
           </div>
@@ -561,52 +777,95 @@ export default function App() {
   }
   if (isLogin) {
     return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
+      <div className="air-shell flex items-center justify-center p-4 text-slate-900">
         <style>{STYLES}</style>
-        <div className="w-full max-w-md rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-          <div className="mb-6 text-center">
-            <p className="text-sm uppercase tracking-[0.32em] text-teal-600">Air-timee login</p>
+        <div className="air-card w-full max-w-md animate-fade-in-up p-8 md:p-10">
+          <div className="mb-8 text-center">
+            <span className="air-kicker">Air-timee login</span>
             <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Secure access</h1>
+            <p className="mt-2 text-sm text-slate-500">Sign in to keep your transactions synced.</p>
           </div>
           <form
             onSubmit={(e) => {
               e.preventDefault();
               const form = e.target;
-              handleLogin(form.username.value, form.password.value);
+              if (registerMode) {
+                if (pendingOtp) {
+                  handleVerifyOtp();
+                } else {
+                  handleRegister(form.username.value, form.password.value);
+                }
+              } else {
+                handleLogin(form.username.value, form.password.value);
+              }
             }}
             className="space-y-5"
           >
             <label className="block space-y-2">
-              <span className="text-sm font-medium text-slate-600">Username</span>
+              <span className="text-sm font-medium text-slate-700">Username</span>
               <input
                 name="username"
                 type="text"
-                className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                autoComplete="username"
+                className="field"
               />
             </label>
             <label className="block space-y-2">
-              <span className="text-sm font-medium text-slate-600">Password</span>
+              <span className="text-sm font-medium text-slate-700">Password</span>
               <input
                 name="password"
                 type="password"
-                className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                autoComplete="current-password"
+                className="field"
               />
             </label>
-            {loginError && <p className="text-sm text-red-700">{loginError}</p>}
+            {pendingOtp && (
+              <label className="block space-y-2">
+                <span className="text-sm font-medium text-slate-700">Verification code</span>
+                <input
+                  name="otp"
+                  value={otpCode}
+                  onChange={(e) => setOtpCode(e.target.value)}
+                  type="text"
+                  className="field"
+                  placeholder="Enter the 6-digit code"
+                />
+              </label>
+            )}
+            {loginError && <p className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{loginError}</p>}
             <button
               type="submit"
               disabled={loginSubmitting}
-              className="inline-flex w-full items-center justify-center rounded-3xl bg-teal-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-teal-500 disabled:opacity-50"
+              className="btn-primary w-full"
             >
-              {loginSubmitting ? "Signing in..." : "Sign in"}
+              {loginSubmitting
+                ? pendingOtp
+                  ? "Verifying..."
+                  : registerMode
+                  ? "Creating account..."
+                  : "Signing in..."
+                : pendingOtp
+                ? "Verify code"
+                : registerMode
+                ? "Create account"
+                : "Sign in"}
             </button>
-            <button
-              type="button"
-              onClick={() => handleNavigate(VIEWS.HOME)}
-              className="inline-flex w-full items-center justify-center rounded-3xl border border-slate-300 bg-white px-6 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
-            >
-              Back to home
-            </button>
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <button
+                type="button"
+                onClick={() => setRegisterMode((prev) => !prev)}
+                className="btn-ghost w-full"
+              >
+                {registerMode ? "Use existing account" : "Create a new account"}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleNavigate(VIEWS.HOME)}
+                className="btn-ghost w-full"
+              >
+                Back to home
+              </button>
+            </div>
           </form>
         </div>
       </div>
@@ -614,59 +873,64 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-4">
+    <div className="air-shell p-4 text-slate-900">
       <style>{STYLES}</style>
       {notification && (
         <div
-          className={`fixed right-4 top-4 z-50 max-w-sm rounded-3xl px-4 py-3 text-sm shadow-2xl transition-all duration-150 ${
+          className={`fixed right-4 top-4 z-[60] flex max-w-sm animate-toast-in items-start gap-3 rounded-2xl px-4 py-3.5 text-sm font-medium text-white shadow-2xl ${
             notification.type === "success"
-              ? "bg-emerald-600 text-white"
+              ? "bg-emerald-600"
               : notification.type === "error"
-              ? "bg-red-600 text-white"
-              : "bg-slate-900 text-white"
+              ? "bg-red-600"
+              : "bg-slate-900"
           }`}
         >
-          {notification.message}
+          <span className="mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-white/20 text-[11px] font-bold">
+            {notification.type === "success" ? "✓" : notification.type === "error" ? "✕" : "i"}
+          </span>
+          <span>{notification.message}</span>
         </div>
       )}
 
-      <div className="w-full max-w-6xl space-y-6">
-        <div className="animate-fade-in-up rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl">
-          <div className="flex flex-wrap items-center justify-between gap-4">
+      <div className="mx-auto w-full max-w-6xl space-y-6">
+        <div className="air-card animate-fade-in-up relative overflow-hidden p-6">
+          <div className="pointer-events-none absolute -right-20 -top-24 h-64 w-64 rounded-full bg-teal-200/40 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-28 left-1/3 h-56 w-56 rounded-full bg-emerald-200/30 blur-3xl" />
+          <div className="relative flex flex-wrap items-center justify-between gap-4">
             <Logo />
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={() => handleNavigate(VIEWS.HOME)}
-                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.HOME ? "bg-teal-600 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+                className={`nav-pill ${view === VIEWS.HOME ? "bg-gradient-to-r from-teal-600 to-emerald-600 text-white shadow-lg shadow-teal-600/25" : "border border-slate-300 bg-white text-slate-700 hover:border-teal-500/50 hover:text-teal-700"}`}
               >
                 Home
               </button>
               <button
                 type="button"
                 onClick={() => handleNavigate(VIEWS.BUY)}
-                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.BUY ? "bg-teal-600 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+                className={`nav-pill ${view === VIEWS.BUY ? "bg-gradient-to-r from-teal-600 to-emerald-600 text-white shadow-lg shadow-teal-600/25" : "border border-slate-300 bg-white text-slate-700 hover:border-teal-500/50 hover:text-teal-700"}`}
               >
                 Buy airtime
               </button>
               <button
                 type="button"
                 onClick={() => handleNavigate(VIEWS.REDEEM)}
-                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.REDEEM ? "bg-teal-600 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+                className={`nav-pill ${view === VIEWS.REDEEM ? "bg-gradient-to-r from-teal-600 to-emerald-600 text-white shadow-lg shadow-teal-600/25" : "border border-slate-300 bg-white text-slate-700 hover:border-teal-500/50 hover:text-teal-700"}`}
               >
                 Redeem
               </button>
               <button
                 type="button"
                 onClick={() => handleNavigate(VIEWS.SUPPORT)}
-                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.SUPPORT ? "bg-slate-900 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+                className={`nav-pill ${view === VIEWS.SUPPORT ? "bg-slate-900 text-white shadow-lg shadow-slate-900/20" : "border border-slate-300 bg-white text-slate-700 hover:border-slate-400 hover:text-slate-900"}`}
               >
                 Support
               </button>
               <button
                 type="button"
                 onClick={() => handleNavigate(VIEWS.ABOUT)}
-                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${view === VIEWS.ABOUT ? "bg-slate-900 text-white" : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}
+                className={`nav-pill ${view === VIEWS.ABOUT ? "bg-slate-900 text-white shadow-lg shadow-slate-900/20" : "border border-slate-300 bg-white text-slate-700 hover:border-slate-400 hover:text-slate-900"}`}
               >
                 About
               </button>
@@ -674,7 +938,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={handleLogout}
-                  className="rounded-full bg-red-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-500"
+                  className="nav-pill bg-red-600 text-white shadow-lg shadow-red-600/25 transition hover:bg-red-500"
                 >
                   Logout
                 </button>
@@ -682,47 +946,126 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => handleNavigate(VIEWS.LOGIN)}
-                  className="rounded-full bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+                  className="nav-pill bg-slate-900 text-white shadow-lg shadow-slate-900/20 transition hover:bg-slate-800"
                 >
                   Login
                 </button>
               )}
             </div>
           </div>
-          <div className="mt-4 rounded-[24px] border border-slate-200 bg-slate-50 p-5 text-slate-600">
-            <p className="text-sm">Air-timee is your M-Pesa airtime partner for fast, secure top-ups with builtin support and admin tools.</p>
+          <div className="relative mt-5 flex items-center gap-4 rounded-[20px] border border-teal-600/10 bg-gradient-to-r from-teal-50 via-teal-50/60 to-emerald-50/70 px-5 py-4">
+            <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-600 to-emerald-600 text-lg text-white shadow-md shadow-teal-600/25">📲</span>
+            <p className="text-sm text-slate-600">
+              Air-timee is your M-Pesa airtime partner for fast, secure top-ups with built-in support and admin tools.
+            </p>
           </div>
         </div>
 
         {isHome && (
-          <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
-            <section className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-              <div className="space-y-6">
-                <h2 className="text-3xl font-semibold text-slate-900">Welcome to Air-timee</h2>
-                <p className="text-slate-600">Use Air-timee to send airtime safely via M-Pesa or redeem a receipt instantly. Our support assistant can also help you with transaction questions.</p>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
-                    <h3 className="text-xl font-semibold text-slate-900">Fast checkout</h3>
-                    <p className="mt-2 text-slate-600">Create a payment request and approve the M-Pesa prompt within seconds.</p>
+          <div className="grid gap-6 xl:grid-cols-[1.55fr_0.85fr]">
+            <section className="air-card animate-fade-in-up relative overflow-hidden p-8 md:p-10">
+              <div className="pointer-events-none absolute -left-16 top-10 h-80 w-80 rounded-full bg-emerald-400/10 blur-3xl" />
+              <div className="pointer-events-none absolute -right-20 top-24 h-64 w-64 rounded-full bg-cyan-400/15 blur-3xl" />
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-48 bg-[radial-gradient(circle_at_center,_rgba(56,189,248,0.18),_transparent_55%)]" />
+              <div className="relative space-y-10">
+                <div className="space-y-5">
+                  <div className="inline-flex items-center gap-3 rounded-full border border-teal-500/20 bg-teal-500/5 px-4 py-2 text-sm font-semibold text-teal-700 shadow-sm shadow-teal-500/10">
+                    <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-teal-600 text-white">⚡</span>
+                    <span>Experience M-Pesa airtime in hyperdrive</span>
                   </div>
-                  <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
-                    <h3 className="text-xl font-semibold text-slate-900">Verify payments</h3>
-                    <p className="mt-2 text-slate-600">Track your transaction status in real time and recover from stuck or failed payments.</p>
+                  <h2 className="text-5xl font-semibold tracking-tight text-slate-950 md:text-6xl">
+                    Welcome to <span className="bg-gradient-to-r from-teal-400 via-cyan-500 to-emerald-500 bg-clip-text text-transparent">Air-timee</span>
+                  </h2>
+                  <p className="max-w-3xl text-lg leading-8 text-slate-600">
+                    Send airtime through M-Pesa with a psychedelic user flow, realtime status pulses, and support that actually feels alive. This homepage is a launchpad for the fast, weird, and wonderful way you top up airtime.
+                  </p>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-3">
+                  <div className="group relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-slate-950/95 p-6 text-white shadow-xl shadow-cyan-500/10 transition duration-300 hover:-translate-y-1 hover:bg-slate-900">
+                    <div className="absolute right-4 top-4 h-24 w-24 rounded-full bg-cyan-400/10 blur-3xl" />
+                    <div className="relative z-10 flex h-14 w-14 items-center justify-center rounded-3xl bg-gradient-to-br from-teal-400 to-cyan-500 text-2xl">🚀</div>
+                    <h3 className="relative z-10 mt-6 text-xl font-semibold">Warp-speed payments</h3>
+                    <p className="relative z-10 mt-3 text-sm text-slate-300">Send a prompt, approve it, and watch the transaction rocket through status.</p>
+                  </div>
+                  <div className="group relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-slate-950/95 p-6 text-white shadow-xl shadow-emerald-500/10 transition duration-300 hover:-translate-y-1 hover:bg-slate-900">
+                    <div className="absolute left-4 bottom-4 h-20 w-20 rounded-full bg-emerald-400/10 blur-3xl" />
+                    <div className="relative z-10 flex h-14 w-14 items-center justify-center rounded-3xl bg-gradient-to-br from-emerald-400 to-teal-500 text-2xl">🧠</div>
+                    <h3 className="relative z-10 mt-6 text-xl font-semibold">Smart support</h3>
+                    <p className="relative z-10 mt-3 text-sm text-slate-300">Support options that surface your latest transaction instantly and keep the flow alive.</p>
+                  </div>
+                  <div className="group relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-slate-950/95 p-6 text-white shadow-xl shadow-slate-500/10 transition duration-300 hover:-translate-y-1 hover:bg-slate-900">
+                    <div className="absolute right-4 bottom-10 h-20 w-20 rounded-full bg-cyan-300/10 blur-3xl" />
+                    <div className="relative z-10 flex h-14 w-14 items-center justify-center rounded-3xl bg-gradient-to-br from-slate-400 to-slate-600 text-2xl">✨</div>
+                    <h3 className="relative z-10 mt-6 text-xl font-semibold">Glow mode</h3>
+                    <p className="relative z-10 mt-3 text-sm text-slate-300">A bold, neon-infused interface with surreal energy and instant airtime vibes.</p>
+                  </div>
+                </div>
+
+                <div className="grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
+                  <div className="rounded-[32px] border border-cyan-300/10 bg-white/95 p-8 shadow-2xl shadow-cyan-500/10">
+                    <div className="inline-flex items-center gap-2 rounded-full bg-cyan-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-cyan-700">Live pulse</div>
+                    <div className="mt-6 flex items-start gap-5">
+                      <div className="flex h-16 w-16 items-center justify-center rounded-3xl bg-gradient-to-br from-cyan-500 to-teal-500 text-2xl text-white shadow-lg">💳</div>
+                      <div>
+                        <p className="text-lg font-semibold text-slate-900">M-Pesa checkout like a sci-fi dashboard</p>
+                        <p className="mt-2 text-slate-600">Every transaction is tracked, verified, and translated into a futuristic delivery experience.</p>
+                      </div>
+                    </div>
+                    <div className="mt-8 grid gap-4 sm:grid-cols-2">
+                      <div className="rounded-3xl border border-slate-200/80 bg-slate-50 p-4">
+                        <p className="text-sm text-slate-500">Status pulse</p>
+                        <p className="mt-2 text-xl font-semibold text-slate-900">Realtime</p>
+                      </div>
+                      <div className="rounded-3xl border border-slate-200/80 bg-slate-50 p-4">
+                        <p className="text-sm text-slate-500">Trusted by</p>
+                        <p className="mt-2 text-xl font-semibold text-slate-900">Instant airtime flows</p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="rounded-[32px] border border-teal-600/10 bg-gradient-to-br from-teal-50 via-cyan-50 to-slate-100 p-8 shadow-2xl shadow-teal-500/5">
+                    <p className="text-sm font-semibold uppercase tracking-[0.24em] text-teal-700">dream state dashboard</p>
+                    <h3 className="mt-4 text-3xl font-semibold text-slate-900">A homepage that feels alive</h3>
+                    <p className="mt-4 text-slate-600">Everything here is designed to feel faster, brighter, and more surprising than a normal payments app.</p>
+                    <div className="mt-8 grid gap-4">
+                      <div className="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm">
+                        <p className="text-sm text-slate-500">Airtime pulse</p>
+                        <p className="mt-2 text-lg font-semibold text-slate-900">instant status updates</p>
+                      </div>
+                      <div className="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm">
+                        <p className="text-sm text-slate-500">Support ready</p>
+                        <p className="mt-2 text-lg font-semibold text-slate-900">chat with context</p>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
             </section>
-            <aside className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-              <h3 className="text-xl font-semibold text-slate-900">Your account</h3>
-              <p className="mt-3 text-slate-600">{isAuthenticated ? `Signed in as ${user}` : "You are not logged in."}</p>
-              {renderLatestTransaction()}
-              <div className="mt-6 space-y-3 rounded-3xl border border-teal-600/10 bg-teal-50 p-5 text-slate-700">
-                <p className="font-semibold text-slate-900">Getting started</p>
-                <ul className="list-disc space-y-2 pl-5 text-slate-600">
-                  <li>Buy airtime with a recipient phone number.</li>
-                  <li>Redeem a valid M-Pesa receipt message.</li>
-                  <li>Use Support if you need help or have issues.</li>
-                </ul>
+            <aside className="air-card animate-fade-in-up relative overflow-hidden p-8" style={{ animationDelay: "90ms" }}>
+              <div className="pointer-events-none absolute -top-10 right-8 h-32 w-32 rounded-full bg-emerald-300/10 blur-3xl" />
+              <div className="pointer-events-none absolute -bottom-10 left-8 h-28 w-28 rounded-full bg-cyan-300/10 blur-3xl" />
+              <div className="relative z-10 rounded-[32px] border border-slate-200/80 bg-slate-950/95 p-6 text-white shadow-2xl shadow-cyan-500/10">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm uppercase tracking-[0.24em] text-cyan-200">Air-timee pilot</p>
+                    <h3 className="mt-2 text-2xl font-semibold">Welcome back{isAuthenticated ? `, ${user}` : ""}</h3>
+                  </div>
+                  <div className="rounded-3xl bg-cyan-500/15 px-3 py-2 text-xs font-semibold uppercase tracking-[0.24em] text-cyan-100 ring-1 ring-cyan-500/20">Live</div>
+                </div>
+                <div className="mt-6 space-y-4 text-slate-300">
+                  <div className="rounded-3xl bg-white/5 p-4">
+                    <p className="text-sm text-cyan-200">Account mode</p>
+                    <p className="mt-2 text-lg font-semibold text-white">{isAuthenticated ? "Synced user" : "Guest preview"}</p>
+                  </div>
+                  <div className="rounded-3xl bg-white/5 p-4">
+                    <p className="text-sm text-cyan-200">Latest transaction</p>
+                    <p className="mt-2 text-lg font-semibold text-white">{latestTransaction ? formatLatestTransactionSummary(latestTransaction) : "No recent activity"}</p>
+                  </div>
+                  <div className="rounded-3xl bg-white/5 p-4">
+                    <p className="text-sm text-cyan-200">Why this page</p>
+                    <p className="mt-2 text-lg font-semibold text-white">It’s bold, flashy, and entirely built around airtime speed.</p>
+                  </div>
+                </div>
               </div>
             </aside>
           </div>
@@ -730,25 +1073,28 @@ export default function App() {
 
         {isBuy && (
           <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
-            <section className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-              <div className="space-y-4">
-                <h2 className="text-3xl font-semibold text-slate-900">Buy airtime</h2>
-                <p className="text-slate-600">Enter the recipient phone and amount to start a top-up with M-Pesa.</p>
+            <section className="air-card animate-fade-in-up p-8 md:p-10">
+              <div className="space-y-6">
+                <div>
+                  <p className="air-kicker">Send airtime</p>
+                  <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Buy airtime</h2>
+                  <p className="mt-2 text-slate-600">Enter the recipient phone and amount to start a top-up with M-Pesa.</p>
+                </div>
                 <form onSubmit={handleSubmit} className="space-y-6">
                   <div className="grid gap-5 sm:grid-cols-2">
-                    <label className="space-y-2">
-                      <span className="text-sm font-medium text-slate-600">Recipient phone number</span>
+                    <label className="block space-y-2">
+                      <span className="text-sm font-medium text-slate-700">Recipient phone number</span>
                       <input
                         type="tel"
                         required
                         placeholder="07XXXXXXXX"
                         value={recipientPhone}
                         onChange={(e) => setRecipientPhone(e.target.value)}
-                        className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                        className="field"
                       />
                     </label>
-                    <label className="space-y-2">
-                      <span className="text-sm font-medium text-slate-600">Amount (KES)</span>
+                    <label className="block space-y-2">
+                      <span className="text-sm font-medium text-slate-700">Amount (KES)</span>
                       <input
                         type="number"
                         required
@@ -756,26 +1102,26 @@ export default function App() {
                         placeholder="100"
                         value={amount}
                         onChange={(e) => setAmount(e.target.value)}
-                        className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                        className="field"
                       />
                     </label>
                   </div>
-                  <label className="space-y-2">
-                    <span className="text-sm font-medium text-slate-600">Your phone number (M-Pesa prompt recipient)</span>
+                  <label className="block space-y-2">
+                    <span className="text-sm font-medium text-slate-700">Your phone number (M-Pesa prompt recipient)</span>
                     <input
                       type="tel"
                       placeholder="07XXXXXXXX"
                       value={buyerPhone}
                       onChange={(e) => setBuyerPhone(e.target.value)}
-                      className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                      className="field"
                     />
-                    <p className="mt-2 text-sm text-slate-500">Leave blank to send the prompt to the recipient number.</p>
+                    <p className="text-sm text-slate-400">Leave blank to send the prompt to the recipient number.</p>
                   </label>
                   {error && <p className="animate-fade-in-up rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
                   <button
                     type="submit"
                     disabled={submitting}
-                    className="inline-flex w-full items-center justify-center gap-3 rounded-3xl bg-teal-600 px-6 py-4 text-base font-semibold text-white shadow-xl shadow-teal-600/20 transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="btn-primary w-full py-4 text-base"
                   >
                     {submitting ? (
                       <>
@@ -787,48 +1133,105 @@ export default function App() {
                     )}
                   </button>
                 </form>
+
+                {showConfirm && (
+                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm">
+                    <div className="air-card w-full max-w-md animate-modal-in p-7">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="air-kicker">Review order</p>
+                          <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">Confirm airtime purchase</h2>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setShowConfirm(false)}
+                          aria-label="Close"
+                          className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      <p className="mt-3 text-sm text-slate-500">Please confirm you want to send airtime to the following number.</p>
+
+                      <div className="mt-6 space-y-1 overflow-hidden rounded-[20px] border border-slate-200/80 bg-slate-50/60">
+                        <div className="flex items-center justify-between gap-4 px-5 py-4">
+                          <span className="text-sm text-slate-500">Phone</span>
+                          <span className="font-semibold text-slate-900">{recipientPhone}</span>
+                        </div>
+                        <div className="flex items-center justify-between gap-4 border-t border-slate-200/60 px-5 py-4">
+                          <span className="text-sm text-slate-500">Amount</span>
+                          <span className="text-lg font-bold text-teal-700">KES {Number(amount).toLocaleString()}</span>
+                        </div>
+                      </div>
+
+                      <div className="mt-7 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+                        <button
+                          type="button"
+                          onClick={() => setShowConfirm(false)}
+                          className="btn-ghost"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          onClick={confirmPayment}
+                          className="btn-primary"
+                        >
+                          Confirm purchase
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </section>
-            <aside className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-              <h3 className="text-xl font-semibold text-slate-900">Why use buy mode?</h3>
-              <p className="mt-3 text-slate-600">Use this view when you want to send airtime to someone else and optionally receive the STK prompt on your own number.</p>
+            <aside className="air-card animate-fade-in-up p-8" style={{ animationDelay: "90ms" }}>
+              <div className="rounded-3xl border border-slate-200/80 bg-slate-50/60 p-6">
+                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-500/15 to-emerald-500/15 text-xl text-teal-700 ring-1 ring-teal-600/15">↗</div>
+                <h3 className="mt-4 text-xl font-semibold text-slate-900">Why use buy mode?</h3>
+                <p className="mt-2 text-slate-600">Use this view when you want to send airtime to someone else and optionally receive the STK prompt on your own number.</p>
+              </div>
             </aside>
           </div>
         )}
 
         {isRedeem && (
           <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
-            <section className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-              <div className="space-y-4">
-                <h2 className="text-3xl font-semibold text-slate-900">Redeem M-Pesa receipt</h2>
-                <p className="text-slate-600">Paste your M-Pesa SMS text and we will verify it before crediting airtime.</p>
+            <section className="air-card animate-fade-in-up p-8 md:p-10">
+              <div className="space-y-6">
+                <div>
+                  <p className="air-kicker">Instant redemption</p>
+                  <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">Redeem M-Pesa receipt</h2>
+                  <p className="mt-2 text-slate-600">Paste your M-Pesa SMS text and we will verify it before crediting airtime.</p>
+                </div>
                 <form onSubmit={handleRedeem} className="space-y-6">
-                  <label className="space-y-2">
-                    <span className="text-sm font-medium text-slate-600">MPesa SMS / message text</span>
+                  <label className="block space-y-2">
+                    <span className="text-sm font-medium text-slate-700">MPesa SMS / message text</span>
                     <textarea
                       required
                       rows={8}
                       value={mpesaText}
                       onChange={(e) => setMpesaText(e.target.value)}
-                      className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                      className="field resize-none leading-relaxed"
                       placeholder="Paste the MPesa message body here"
                     />
                   </label>
-                  <label className="space-y-2">
-                    <span className="text-sm font-medium text-slate-600">Optional phone number</span>
+                  <label className="block space-y-2">
+                    <span className="text-sm font-medium text-slate-700">Optional phone number</span>
                     <input
                       type="tel"
                       placeholder="07XXXXXXXX"
                       value={redeemPhone}
                       onChange={(e) => setRedeemPhone(e.target.value)}
-                      className="w-full rounded-3xl border border-slate-300 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                      className="field"
                     />
+                    <p className="text-sm text-slate-400">Leave blank to credit the phone detected from the message.</p>
                   </label>
                   {error && <p className="animate-fade-in-up rounded-3xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
                   <button
                     type="submit"
                     disabled={submitting}
-                    className="inline-flex w-full items-center justify-center gap-3 rounded-3xl bg-teal-600 px-6 py-4 text-base font-semibold text-white shadow-xl shadow-teal-600/20 transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="btn-primary w-full py-4 text-base"
                   >
                     {submitting ? (
                       <>
@@ -842,31 +1245,39 @@ export default function App() {
                 </form>
               </div>
             </section>
-            <aside className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-              <h3 className="text-xl font-semibold text-slate-900">Redeem flow</h3>
-              <p className="mt-3 text-slate-600">Use this mode when you already have a valid M-Pesa receipt text to convert into airtime.</p>
+            <aside className="air-card animate-fade-in-up p-8" style={{ animationDelay: "90ms" }}>
+              <div className="rounded-3xl border border-slate-200/80 bg-slate-50/60 p-6">
+                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-500/15 to-emerald-500/15 text-xl text-teal-700 ring-1 ring-teal-600/15">⇄</div>
+                <h3 className="mt-4 text-xl font-semibold text-slate-900">Redeem flow</h3>
+                <p className="mt-2 text-slate-600">Use this mode when you already have a valid M-Pesa receipt text to convert into airtime.</p>
+              </div>
             </aside>
           </div>
         )}
 
         {isSupport && (
-          <div className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+          <div className="air-card animate-fade-in-up p-8">
             <SupportChat currentTransactionId={transactionId} />
           </div>
         )}
 
         {isAbout && (
-          <div className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
+          <div className="air-card animate-fade-in-up p-8">
             <div className="space-y-6">
-              <h2 className="text-3xl font-semibold text-slate-900">About Air-timee</h2>
+              <div>
+                <p className="air-kicker">About Air-timee</p>
+                <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">About Air-timee</h2>
+              </div>
               <p className="text-slate-600">Air-timee is a lightweight M-Pesa airtime vending platform with payment tracking, redemption support, and an admin dashboard for operations.</p>
               <div className="grid gap-4 sm:grid-cols-2">
-                <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
-                  <h3 className="text-xl font-semibold text-slate-900">Mission</h3>
+                <div className="rounded-3xl border border-slate-200/80 bg-slate-50/60 p-6">
+                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-500/15 to-emerald-500/15 text-xl text-teal-700 ring-1 ring-teal-600/15">✦</div>
+                  <h3 className="mt-4 text-xl font-semibold text-slate-900">Mission</h3>
                   <p className="mt-2 text-slate-600">Make airtime top-up easy, transparent, and reliable for buyers and operators.</p>
                 </div>
-                <div className="rounded-3xl border border-slate-200 bg-slate-50 p-6">
-                  <h3 className="text-xl font-semibold text-slate-900">Security</h3>
+                <div className="rounded-3xl border border-slate-200/80 bg-slate-50/60 p-6">
+                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-500/15 to-emerald-500/15 text-xl text-teal-700 ring-1 ring-teal-600/15">🔒</div>
+                  <h3 className="mt-4 text-xl font-semibold text-slate-900">Security</h3>
                   <p className="mt-2 text-slate-600">Protected access and environment-based secrets keep your service safe in production.</p>
                 </div>
               </div>
@@ -875,8 +1286,8 @@ export default function App() {
         )}
 
         {isBuy || isRedeem ? (
-          <div className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-xl">
-            <div className="space-y-5">
+          <div className="air-card animate-fade-in-up p-8">
+            <div className="space-y-6">
               <ProgressSteps status={status} />
               <DeliveryAnimation status={status} />
             </div>
@@ -899,10 +1310,10 @@ function StatusPanel({ status, error, onReset }) {
 
   return (
     <div className="mt-8 space-y-6">
-      <div className="animate-fade-in-up rounded-[28px] border border-teal-600/10 bg-slate-50 p-6 shadow-inner">
+      <div className="animate-fade-in-up rounded-[28px] border border-teal-600/10 bg-gradient-to-br from-slate-50 to-teal-50/50 p-6 shadow-inner">
         <div className="flex items-center justify-between gap-4">
           <div>
-            <p className="text-sm uppercase tracking-[0.24em] text-teal-600">Current status</p>
+            <p className="air-kicker">Current status</p>
             <h3 className="mt-2 text-xl font-semibold text-slate-900">{badge}</h3>
           </div>
           <span className="rounded-full bg-slate-100 px-4 py-2 text-sm text-slate-600 ring-1 ring-slate-200">Step {STATUS_STEP[status] || 1}</span>
@@ -928,7 +1339,7 @@ function StatusPanel({ status, error, onReset }) {
       {canReset && (
         <button
           onClick={onReset}
-          className="w-full rounded-3xl border border-teal-600/20 bg-teal-50 px-5 py-3 text-sm font-semibold text-teal-700 transition hover:bg-teal-100"
+          className="btn-primary w-full"
         >
           Buy more airtime
         </button>
@@ -952,28 +1363,40 @@ function ProgressSteps({ status }) {
   const descs = ["STK push sent to your phone", "Payment received from M-Pesa", "Airtime sent to the target number"];
 
   const iconClass = (state) => {
-    if (state === "done") return "bg-emerald-500 text-white";
-    if (state === "active") return "bg-teal-600 text-white ring-2 ring-teal-500/40";
-    if (state === "failed") return "bg-red-500 text-white";
-    return "bg-slate-100 text-slate-400";
+    if (state === "done") return "bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-md shadow-emerald-500/30";
+    if (state === "active") return "bg-teal-600 text-white ring-2 ring-teal-500/40 shadow-md shadow-teal-600/30";
+    if (state === "failed") return "bg-red-500 text-white shadow-md shadow-red-500/30";
+    return "bg-slate-100 text-slate-400 ring-1 ring-slate-200";
   };
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
       {states.map((state, i) => (
         <div
           key={i}
-          className="animate-fade-in-up flex items-center gap-4 rounded-3xl border border-slate-200 bg-white px-4 py-4"
+          className="animate-fade-in-up relative flex items-center gap-4 rounded-3xl border border-slate-200/80 bg-white px-5 py-4 shadow-sm transition duration-200 hover:border-teal-600/20 hover:shadow-md hover:shadow-teal-600/5"
           style={{ animationDelay: `${i * 90}ms` }}
         >
-          <div className={`flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-2xl text-lg ${iconClass(state)}`}>
+          {/* connector line between steps (hidden on the last one) */}
+          {i < states.length - 1 && (
+            <span
+              className={`absolute bottom-[-16px] left-[22px] h-4 w-px ${state === "done" ? "bg-emerald-400" : "bg-slate-200"}`}
+              aria-hidden="true"
+            />
+          )}
+          <div className={`relative z-10 flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-2xl text-lg font-semibold ${iconClass(state)}`}>
             {state === "done" ? "✓" : state === "failed" ? "✕" : i + 1}
           </div>
           <div className="min-w-0">
-            <p className="font-medium text-slate-900">{titles[i]}</p>
+            <p className={`font-medium ${state === "waiting" ? "text-slate-400" : "text-slate-900"}`}>{titles[i]}</p>
             <p className={`truncate text-sm ${state === "waiting" ? "text-slate-400" : "text-slate-500"}`}>{descs[i]}</p>
           </div>
-          {state === "active" && <span className="ml-auto h-2 w-2 flex-shrink-0 animate-ping rounded-full bg-teal-500" />}
+          {state === "active" && (
+            <span className="ml-auto flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-teal-600">
+              <span className="h-2 w-2 animate-ping rounded-full bg-teal-500" />
+              In progress
+            </span>
+          )}
         </div>
       ))}
     </div>
@@ -987,7 +1410,7 @@ function DeliveryAnimation({ status }) {
   const isFailed = status === "AIRTIME_FAILED" || status === "PAYMENT_FAILED";
 
   return (
-    <div className="animate-fade-in-up relative overflow-hidden rounded-[32px] border border-slate-200 bg-white p-6 shadow-xl" style={{ animationDelay: "160ms" }}>
+    <div className="animate-fade-in-up relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-gradient-to-b from-slate-50/80 to-white p-6 shadow-sm" style={{ animationDelay: "160ms" }}>
       <div className="absolute -right-10 top-6 h-32 w-32 rounded-full bg-teal-400/20 blur-3xl" />
       <div className="absolute left-4 top-12 h-16 w-16 rounded-full bg-emerald-300/30 blur-3xl" />
 

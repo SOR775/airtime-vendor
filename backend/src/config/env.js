@@ -31,6 +31,12 @@ module.exports = {
 
   jwtSecret: process.env.JWT_SECRET,
   webhookSharedSecret: process.env.WEBHOOK_SHARED_SECRET,
+  // SMTP (for OTP emails) - provide SMTP credentials (Gmail app password recommended)
+  smtpHost: process.env.SMTP_HOST,
+  smtpPort: Number(process.env.SMTP_PORT || 587),
+  smtpUser: process.env.SMTP_USER,
+  smtpPass: process.env.SMTP_PASS,
+  smtpSecure: process.env.SMTP_SECURE === "true",
   
   // Minimum amount supported by the configured airtime provider. If a
   // requested amount is lower during development, the service may fall
